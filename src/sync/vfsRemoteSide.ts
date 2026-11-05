@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { OUTPUT_FOLDER_NAME } from '../consts';
 import { FileRefEntity, RemoteFileSystemProvider, VirtualFileSystem } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
-import { CommentSource, joinComments } from './comments';
+import { CommentSource, OnlineComment, joinComments } from './comments';
 import { RemoteEntry, RemoteSide } from './folderSync';
 
 /** The online side of a folder sync: an Overleaf project, through the extension's virtual file system. */
@@ -99,6 +99,10 @@ export class VfsRemoteSide implements RemoteSide, CommentSource, vscode.Disposab
         const { docRanges, threads } = await this.vfs.getComments();
         const docs = this.vfs.walk((entity) => entity._type === 'doc');
         return joinComments(docRanges, threads, new Map(docs.map(({ entity, path }) => [entity._id, path.replace(/^\//, '')])));
+    }
+
+    async setCommentResolved(comment: OnlineComment, resolved: boolean) {
+        await this.vfs.setCommentResolved(comment.docId, comment.threadId, resolved);
     }
 
     private async ensureFolder(path: string) {

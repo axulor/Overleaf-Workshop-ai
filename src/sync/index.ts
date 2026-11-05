@@ -38,6 +38,8 @@ export class FolderSyncManager {
             { dispose: () => this.stop() },
             vscode.commands.registerCommand(`${ROOT_NAME}.sync.linkProject`, (item) => this.linkProject(item)),
             vscode.commands.registerCommand(`${ROOT_NAME}.sync.showStatus`, () => this.showStatus()),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.resolveComment`, (thread: vscode.CommentThread) => this.comments?.resolve(thread)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.reopenComment`, () => this.comments?.reopen()),
         ];
     }
 

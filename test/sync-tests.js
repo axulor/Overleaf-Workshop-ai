@@ -614,7 +614,7 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
     paths,
   );
   check('join: comments are in document order, by file', joined.map((c) => c.threadId).join() === 't1,t2,t3', JSON.stringify(joined.map((c) => c.threadId)));
-  check('join: what was said, by whom, and where', joined[0].path === 'main.tex' && joined[0].quote === 'first' && joined[0].offset === 5 && joined[0].messages[0].text === '这里要改' && joined[0].messages[0].author === 'Ada Lovelace', JSON.stringify(joined[0]));
+  check('join: what was said, by whom, and where', joined[0].path === 'main.tex' && joined[0].docId === 'd1' && joined[0].quote === 'first' && joined[0].offset === 5 && joined[0].messages[0].text === '这里要改' && joined[0].messages[0].author === 'Ada Lovelace', JSON.stringify(joined[0]));
   check('join: a resolved thread is marked', joined[1].resolved === true && joined[0].resolved === false);
   check('join: a person without a name shows as their email', joined[2].messages[0].author === 'only@example.com');
   joined = joinComments([docRange('d1', ['t1', 'x', 0])], { t1: { messages: [] } }, paths);
@@ -637,7 +637,7 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   const output = path.join(folder, '.output', 'comments.md');
   const put = (file, text) => fs.writeFileSync(file, text, 'utf8');
   const listing = () => (fs.existsSync(output) ? fs.readFileSync(output, 'utf8') : '');
-  const comment = (threadId, quote, offset, overrides = {}) => ({ threadId, path: 'main.tex', quote, offset, resolved: false, messages: [{ author: 'Ada Lovelace', text: '这里要改', time: 1793865710628 }], ...overrides });
+  const comment = (threadId, quote, offset, overrides = {}) => ({ threadId, docId: 'doc-of-main', path: 'main.tex', quote, offset, resolved: false, messages: [{ author: 'Ada Lovelace', text: '这里要改', time: 1793865710628 }], ...overrides });
   const emitter = new vscode.EventEmitter();
   const source = {
     onDidChangeComments: emitter.event,
@@ -648,6 +648,12 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
       this.reads++;
       if (this.failing) throw new Error('no connection');
       return this.comments;
+    },
+    changes: [],
+    refuse: false,
+    async setCommentResolved(target, resolved) {
+      if (this.refuse) throw new Error('403: not allowed');
+      this.changes.push({ threadId: target.threadId, docId: target.docId, resolved });
     },
   };
   const logged = [];
@@ -737,6 +743,51 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   source.comments = [comment('t3', '', 0, { path: 'sections/later.tex' })];
   emitter.fire();
   check('comments: a comment at the very start of a file that begins with an empty line', await until(() => rangeIs('t3', 0, 0, 0, 0)), shownRange('t3'));
+
+  // resolving here
+  const errors = [];
+  comments.showError = (m) => errors.push(m);
+  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length), comment('t2', 'first', 0)];
+  emitter.fire();
+  await until(() => !!thread('t1') && !!thread('t2'));
+  const threadOne = thread('t1');
+  await comments.resolve(threadOne);
+  check('resolving: Overleaf is told which comment, in which document', source.changes.length === 1 && source.changes[0].threadId === 't1' && source.changes[0].docId === 'doc-of-main' && source.changes[0].resolved === true, JSON.stringify(source.changes));
+  check('resolving: the comment leaves the text at once', !thread('t1') && !!thread('t2'));
+  check('resolving: and is listed as resolved', listing().includes('## Open (1)') && listing().includes('## Resolved (1)'), listing());
+
+  // Overleaf announces it too, and what it says then still holds
+  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length, { resolved: true }), comment('t2', 'first', 0)];
+  emitter.fire();
+  await sleep(SETTLE_MS);
+  check('resolving: the announcement changes nothing more', !thread('t1') && !!thread('t2'));
+
+  comments.pickComment = async (candidates) => {
+    source.offered = candidates.map((c) => c.threadId);
+    return candidates[0];
+  };
+  await comments.reopen();
+  check('reopening: only resolved comments are offered', source.offered.join() === 't1', JSON.stringify(source.offered));
+  check('reopening: Overleaf is told', source.changes.length === 2 && source.changes[1].threadId === 't1' && source.changes[1].resolved === false, JSON.stringify(source.changes));
+  check('reopening: the comment is back on the text', !!thread('t1') && rangeIs('t1', 1, 5, 1, 8), shownRange('t1'));
+  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length), comment('t2', 'first', 0)];
+  emitter.fire();
+  await until(() => listing().includes('## Resolved (0)'));
+
+  comments.pickComment = async () => undefined;
+  const changesBefore = source.changes.length;
+  await comments.reopen();
+  check('reopening: closing the list changes nothing', source.changes.length === changesBefore);
+
+  source.refuse = true;
+  await comments.resolve(thread('t2'));
+  check('refused: the comment stays', !!thread('t2'));
+  check('refused: and the user is told why', errors.length === 1 && errors[0].includes('403'), JSON.stringify(errors));
+  source.refuse = false;
+
+  source.comments = [comment('t3', '', 0, { path: 'sections/later.tex' })];
+  emitter.fire();
+  await until(() => !!thread('t3') && !thread('t1'));
 
   // no connection
   source.failing = true;

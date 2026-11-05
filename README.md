@@ -14,7 +14,7 @@ my-paper/                    open this folder in VS Code
 ├─ zh/, data/, code/, ...    anything else stays local
 ```
 
-Open your paper's folder, hover over a project in the Overleaf panel and click the cloud icon (`同步到本地`).
+Open your paper's folder, hover over a project in the Overleaf panel and click the cloud icon (`同步到本地`). The original ways of opening a project are hidden, as tools cannot work in their virtual folders and the old local replica does not sync by itself. The setting `overleaf-workshop.projectManager.showOriginalOpenActions` brings them back.
 
 - Any change to a file reaches Overleaf about a second later, whichever tool made it. Typing in VS Code does too, without saving.
 - Changes are sent as real-time edits of the difference, not by replacing files, so collaborators' comments stay in place.
@@ -26,7 +26,7 @@ Open your paper's folder, hover over a project in the Overleaf panel and click t
 
 ### Comments
 
-Comments made on Overleaf show on the commented text and in VS Code's Comments panel, and follow the text as it changes. Replying and resolving still happen on Overleaf.
+Comments made on Overleaf show on the commented text and in VS Code's Comments panel, and follow the text as it changes. The ✓ on a comment resolves it, and the button at the top of the Comments panel reopens a resolved one. Replying still happens on Overleaf.
 
 They are also kept in `.output/comments.md` in the project folder, with the file, line, commented text, author and words of each comment, so any tool can read them. This file is rewritten when comments change, and the `.output` folder is kept out of git.
 
@@ -39,7 +39,7 @@ They are also kept in `.output/comments.md` in the project folder, with the file
 - A manual compile is no longer sent to Overleaf as an auto-compile.
 - An error during a compile no longer blocks later compiles until the window is reloaded.
 - A project with no main document set uses `main.tex` or its only `.tex` file, and asks if neither applies.
-- Next to LaTeX Workshop, a synced workspace turns off its automatic local builds and its compile shortcuts, in `.vscode/settings.json`, so `Ctrl+Alt+B` compiles on Overleaf and no local build fails on every change. A value already set in the workspace is left alone. LaTeX Workshop's own ▶ button stays and still builds locally; the button that compiles on Overleaf has a cloud icon.
+- Next to LaTeX Workshop, a synced workspace turns off its automatic local builds and its compile shortcuts, in `.vscode/settings.json`, so `Ctrl+Alt+B` compiles on Overleaf and no local build fails on every change. A value already set in the workspace is left alone. LaTeX Workshop's own ▶ button stays and still builds locally; the button that compiles on Overleaf has a circle around its triangle.
 
 To run the tests, which use fake Overleaf responses and need no account: `powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1`. To try this build against a real account without touching your own VS Code: `test\dev-window.ps1`.
 

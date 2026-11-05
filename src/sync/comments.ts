@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { CommentThreadSchema, DocRangesSchema } from '../api/base';
-import { OUTPUT_FOLDER_NAME } from '../consts';
+import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { decodeText } from './merge';
 
 export const COMMENTS_FILE_NAME = 'comments.md';
@@ -18,6 +18,7 @@ export interface CommentMessage {
 
 export interface OnlineComment {
     threadId: string;
+    docId: string;
     path: string;
     /** The commented text. */
     quote: string;
@@ -30,6 +31,7 @@ export interface OnlineComment {
 export interface CommentSource {
     readonly onDidChangeComments: vscode.Event<void>;
     readComments(): Promise<OnlineComment[]>;
+    setCommentResolved(comment: OnlineComment, resolved: boolean): Promise<void>;
 }
 
 /** Overleaf keeps where comments are and what was said apart. A comment with nothing said yet is still being created. */
@@ -43,6 +45,7 @@ export function joinComments(docRanges: DocRangesSchema[], threads: {[threadId: 
             if (!thread?.messages?.length) { continue; }
             comments.push({
                 threadId: op.t,
+                docId: doc.id,
                 path,
                 quote: op.c,
                 offset: op.p,
@@ -164,6 +167,47 @@ export class ProjectComments implements vscode.Disposable {
         clearTimeout(this.relocateTimer);
         clearTimeout(this.changedQuoteTimer);
         this.disposables.forEach((disposable) => disposable.dispose());
+        vscode.commands.executeCommand('setContext', `${ROOT_NAME}.hasResolvedComments`, false);
+    }
+
+    /** For the button on a thread in the editor. */
+    async resolve(thread: vscode.CommentThread) {
+        const shown = [...this.shown].find(([, entry]) => entry.thread === thread);
+        const comment = this.comments.find((candidate) => candidate.threadId === shown?.[0]);
+        if (comment) { await this.setResolved(comment, true); }
+    }
+
+    /** A resolved comment shows nowhere in the editor, so a mistaken click is undone from a list. */
+    async reopen() {
+        const comment = await this.pickComment(this.comments.filter((candidate) => candidate.resolved));
+        if (comment) { await this.setResolved(comment, false); }
+    }
+
+    private async pickComment(comments: PlacedComment[]) {
+        const picked = await vscode.window.showQuickPick(comments.map((comment) => ({
+            label: comment.messages[0].text.split('\n')[0],
+            description: `${comment.messages[0].author} · ${comment.path}`,
+            detail: comment.quote.split('\n')[0],
+            comment,
+        })), {title: '重新打开已解决的批注'});
+        return picked?.comment;
+    }
+
+    private async setResolved(comment: PlacedComment, resolved: boolean) {
+        try {
+            await this.source.setCommentResolved(comment, resolved);
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            this.showError(`无法${resolved ? '解决' : '重新打开'}这条批注：${reason}`);
+            return;
+        }
+        // Overleaf announces this too, which brings a full refresh, but the button should not wait for that.
+        comment.resolved = resolved;
+        await this.relocate();
+    }
+
+    private showError(message: string) {
+        vscode.window.showErrorMessage(message);
     }
 
     private pathOf(uri: vscode.Uri) {
@@ -268,7 +312,8 @@ export class ProjectComments implements vscode.Disposable {
 
     /** As on Overleaf's page, a resolved comment leaves the text. */
     private showThreads() {
-        const wanted = new Map(this.comments.filter((comment) => !comment.resolved && comment.range).map((comment) => [comment.threadId, comment]));
+        vscode.commands.executeCommand('setContext', `${ROOT_NAME}.hasResolvedComments`, this.comments.some((comment) => comment.resolved));
+        const wanted =new Map(this.comments.filter((comment) => !comment.resolved && comment.range).map((comment) => [comment.threadId, comment]));
         for (const [threadId, { thread }] of this.shown) {
             const comment = wanted.get(threadId);
             if (!comment || thread.uri.path !== this.uriOf(comment.path).path) {
@@ -281,7 +326,8 @@ export class ProjectComments implements vscode.Disposable {
             if (!entry) {
                 const thread = this.controller.createCommentThread(this.uriOf(comment.path), comment.range!, []);
                 thread.canReply = false;
-                thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
+                thread.label = 'Overleaf 批注';
+                thread.collapsibleState =vscode.CommentThreadCollapsibleState.Collapsed;
                 entry = {thread, said: ''};
                 this.shown.set(threadId, entry);
             } else if (!entry.thread.range?.isEqual(comment.range!)) {

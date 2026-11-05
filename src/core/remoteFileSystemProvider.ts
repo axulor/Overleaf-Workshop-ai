@@ -1464,6 +1464,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
         return {docRanges: ranges.docRanges ?? [], threads: threads.threads ?? {}};
     }
+
+    async setCommentResolved(docId:string, threadId:string, resolved:boolean) {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.setCommentThreadResolved(identity, this.projectId, docId, threadId, resolved);
+        if (res.type!=='success') {
+            throw new Error(res.message ?? 'Overleaf did not accept the change');
+        }
+    }
 }
 
 export class RemoteFileSystemProvider implements vscode.FileSystemProvider {

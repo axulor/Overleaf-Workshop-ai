@@ -2,7 +2,7 @@
   "name": "overleaf-workshop-ai",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "icon": "resources/icons/app_icon.png",
   "license": "AGPL-3.0-only",
   "author": {
@@ -287,6 +287,18 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.sync.resolveComment",
+        "title": "解决批注",
+        "icon": "$(check)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.reopenComment",
+        "title": "重新打开已解决的批注",
+        "icon": "$(history)",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.projectHistory.refresh",
         "title": "%commands.projectHistory.refresh.title%",
         "icon": "$(refresh)",
@@ -355,7 +367,7 @@
       {
         "command": "overleaf-workshop.compileManager.compile",
         "title": "%commands.compileManager.compile.title%",
-        "icon": "$(cloud)",
+        "icon": "$(play-circle)",
         "enablement": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
         "category": "%extension.displayName%"
       },
@@ -438,6 +450,12 @@
     "configuration": {
       "title": "%extension.displayName%",
       "properties": {
+        "overleaf-workshop.projectManager.showOriginalOpenActions": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "markdownDescription": "在项目列表中显示原有的打开方式：`Open Project in Current Window`、`Open Project in New Window` 和 `Open Project Locally ...`。前两个打开的是虚拟文件夹，AI 助手无法在里面工作；第三个是不会自动同步的旧本地副本。平时用“同步到本地”即可。"
+        },
         "overleaf-workshop.compileOnSave.enabled": {
           "type": "boolean",
           "default": true,
@@ -585,6 +603,23 @@
       ]
     },
     "menus": {
+      "commandPalette": [
+        {
+          "command": "overleaf-workshop.sync.resolveComment",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.sync.reopenComment",
+          "when": "overleaf-workshop.hasResolvedComments"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "overleaf-workshop.sync.resolveComment",
+          "group": "inline",
+          "when": "commentController == overleaf-workshop-ai.comments"
+        }
+      ],
       "explorer/context": [
         {
           "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
@@ -606,6 +641,11 @@
         }
       ],
       "view/title": [
+        {
+          "command": "overleaf-workshop.sync.reopenComment",
+          "group": "navigation",
+          "when": "view == workbench.panel.comments && overleaf-workshop.hasResolvedComments"
+        },
         {
           "command": "overleaf-workshop.projectManager.addServer",
           "when": "view == overleaf-workshop.projectManager",
@@ -730,27 +770,27 @@
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag) && config.overleaf-workshop.projectManager.showOriginalOpenActions",
           "group": "inline@3"
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag) && config.overleaf-workshop.projectManager.showOriginalOpenActions",
           "group": "inline@4"
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag) && config.overleaf-workshop.projectManager.showOriginalOpenActions",
           "group": "1_openActions@1"
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag) && config.overleaf-workshop.projectManager.showOriginalOpenActions",
           "group": "1_openActions@2"
         },
         {
           "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "when": "view == overleaf-workshop.projectManager && (viewItem == project || viewItem == project_in_tag) && config.overleaf-workshop.projectManager.showOriginalOpenActions",
           "group": "1_openActions@3"
         },
         {
