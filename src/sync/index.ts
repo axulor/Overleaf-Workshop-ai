@@ -3,6 +3,7 @@ import { CompileManager } from '../compile/compileManager';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { CompileOutcome, RemoteFileSystemProvider, VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import { ProjectComments } from './comments';
 import { ConflictReason, DEFAULT_IGNORE_PATTERNS, FolderSync, SyncStatus } from './folderSync';
 import { VfsRemoteSide } from './vfsRemoteSide';
 
@@ -22,6 +23,7 @@ const COMPARE = '查看差异';
 export class FolderSyncManager {
     private sync?: FolderSync;
     private remote?: VfsRemoteSide;
+    private comments?: ProjectComments;
     private readonly log = vscode.window.createOutputChannel('Overleaf Workshop AI Sync', {log: true});
     private readonly statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -2);
 
@@ -187,6 +189,8 @@ export class FolderSyncManager {
 
             await this.sync.start();
             this.log.info(`Syncing ${folder.fsPath} with ${parseUri(projectUri).projectName}`);
+            this.comments = new ProjectComments(folder, parseUri(projectUri).projectName, this.remote, (message) => this.log.info(message));
+            await this.comments.start();
         } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
             this.log.error(`Could not start syncing: ${reason}`);
@@ -195,8 +199,10 @@ export class FolderSyncManager {
     }
 
     private stop() {
+        this.comments?.dispose();
         this.sync?.dispose();
         this.remote?.dispose();
+        this.comments = undefined;
         this.sync = undefined;
         this.remote = undefined;
         CompileManager.beforeCompile = undefined;

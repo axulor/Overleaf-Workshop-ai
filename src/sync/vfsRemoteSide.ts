@@ -2,24 +2,33 @@ import * as vscode from 'vscode';
 import { OUTPUT_FOLDER_NAME } from '../consts';
 import { FileRefEntity, RemoteFileSystemProvider, VirtualFileSystem } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
+import { CommentSource, joinComments } from './comments';
 import { RemoteEntry, RemoteSide } from './folderSync';
 
 /** The online side of a folder sync: an Overleaf project, through the extension's virtual file system. */
-export class VfsRemoteSide implements RemoteSide, vscode.Disposable {
+export class VfsRemoteSide implements RemoteSide, CommentSource, vscode.Disposable {
     private readonly changeEmitter = new vscode.EventEmitter<string | undefined>();
     private readonly connectEmitter = new vscode.EventEmitter<void>();
     private readonly disconnectEmitter = new vscode.EventEmitter<void>();
+    private readonly commentsEmitter = new vscode.EventEmitter<void>();
     readonly onDidChange = this.changeEmitter.event;
     readonly onDidConnect = this.connectEmitter.event;
     readonly onDidDisconnect = this.disconnectEmitter.event;
+    readonly onDidChangeComments = this.commentsEmitter.event;
     private readonly disposables: vscode.Disposable[];
 
     constructor(private readonly vfs: VirtualFileSystem, provider: RemoteFileSystemProvider) {
         this.disposables = [
-            this.changeEmitter, this.connectEmitter, this.disconnectEmitter,
+            this.changeEmitter, this.connectEmitter, this.disconnectEmitter, this.commentsEmitter,
             provider.onDidChangeFile((events) => this.onRemoteEvents(events)),
+            EventBus.on('commentsChangedEvent', ({ projectId }) => {
+                if (projectId === this.vfs.projectId) { this.commentsEmitter.fire(); }
+            }),
             EventBus.on('projectJoinedEvent', ({ projectId }) => {
-                if (projectId === this.vfs.projectId) { this.connectEmitter.fire(); }
+                if (projectId === this.vfs.projectId) {
+                    this.connectEmitter.fire();
+                    this.commentsEmitter.fire(); // anything may have happened while disconnected
+                }
             }),
             EventBus.on('projectDisconnectedEvent', ({ projectId }) => {
                 if (projectId === this.vfs.projectId) { this.disconnectEmitter.fire(); }
@@ -83,6 +92,13 @@ export class VfsRemoteSide implements RemoteSide, vscode.Disposable {
 
     async remove(path: string) {
         await this.vfs.remove(this.uri(path), false);
+    }
+
+    async readComments() {
+        await this.vfs.init();
+        const { docRanges, threads } = await this.vfs.getComments();
+        const docs = this.vfs.walk((entity) => entity._type === 'doc');
+        return joinComments(docRanges, threads, new Map(docs.map(({ entity, path }) => [entity._id, path.replace(/^\//, '')])));
     }
 
     private async ensureFolder(path: string) {

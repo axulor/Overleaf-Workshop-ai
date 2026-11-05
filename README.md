@@ -24,6 +24,12 @@ Open your paper's folder, hover over a project in the Overleaf panel and click t
 - Compile results are copied to `.output/` in the project folder. A compile first sends all pending changes.
 - Changes made while VS Code is closed or offline are merged when it reconnects.
 
+### Comments
+
+Comments made on Overleaf show on the commented text and in VS Code's Comments panel, and follow the text as it changes. Replying and resolving still happen on Overleaf.
+
+They are also kept in `.output/comments.md` in the project folder, with the file, line, commented text, author and words of each comment, so any tool can read them. This file is rewritten when comments change, and the `.output` folder is kept out of git.
+
 ### Compiling
 
 - A PDF with LaTeX errors in its log no longer shows as a failed compile. As on Overleaf's own page, the PDF is available and the errors are listed in the Problems panel.

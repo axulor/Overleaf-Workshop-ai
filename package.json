@@ -2,7 +2,7 @@
   "name": "overleaf-workshop-ai",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "icon": "resources/icons/app_icon.png",
   "license": "AGPL-3.0-only",
   "author": {

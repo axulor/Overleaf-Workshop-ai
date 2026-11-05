@@ -17,6 +17,7 @@ async function until(condition, ms = 6000) {
   return false;
 }
 const SETTLE_MS = 1500;
+const { EventBus } = require(path.join(out, 'utils', 'eventBus.js'));
 
 /** An in-memory Overleaf project that records everything done to it. */
 class FakeRemote {
@@ -451,7 +452,7 @@ async function testReplaceDocContent(VirtualFileSystem, GlobalStateManager) {
           if (server.fail) throw 'timeout';
           server.text = applyOps(server.text, update.op);
           server.version++;
-          handlers.onFileChanged({ doc: id, v: update.v }); // the acknowledgement carries no op
+          if (!server.ackLater) { handlers.onFileChanged({ doc: id, v: update.v }); } // the acknowledgement carries no op
         },
       },
     });
@@ -507,6 +508,66 @@ async function testReplaceDocContent(VirtualFileSystem, GlobalStateManager) {
   t.handlers.onFileChanged({ doc: 'doc1', v: 99, op: [{ p: 0, i: 'x' }] });
   check('out of step: the cache is dropped', t.doc.remoteCache === undefined);
   check('out of step: the sync is told to look again', t.notified.some((e) => e.uri.path === '/Test/main.tex'));
+
+  // the server replies when it has queued an update, and acknowledges later
+  server = { text: 'Base.\n', version: 3, ackLater: true };
+  t = make(server);
+  await t.vfs.openFile(DOC_URI);
+  let finished = false;
+  const writing = t.vfs.replaceDocContent(DOC_URI, 'Base one.\n').then(() => { finished = true; });
+  await sleep(200);
+  check('acknowledgement: a write waits for it', !finished);
+  t.handlers.onFileChanged({ doc: 'doc1', v: 3 });
+  await writing;
+  check('acknowledgement: then the write is done', finished && t.doc.version === 4 && t.doc.remoteCache === 'Base one.\n', `${t.doc.version} ${JSON.stringify(t.doc.remoteCache)}`);
+  const joinsBefore = t.sent.filter((s) => s === 'join').length;
+  const nextWrite = t.vfs.replaceDocContent(DOC_URI, 'Base one two.\n');
+  await sleep(50);
+  check('acknowledgement: the next write uses the version it brought', t.sent[t.sent.length - 1].v === 4, JSON.stringify(t.sent[t.sent.length - 1]));
+  t.handlers.onFileChanged({ doc: 'doc1', v: 4 });
+  await nextWrite;
+  check('acknowledgement: no reason to join the document again', t.sent.filter((s) => s === 'join').length === joinsBefore);
+
+  server = { text: 'Base.\n', version: 3, ackLater: true };
+  t = make(server);
+  await t.vfs.openFile(DOC_URI);
+  thrown = false;
+  await t.vfs.replaceDocContent(DOC_URI, 'Never acknowledged.\n').catch(() => { thrown = true; });
+  check('no acknowledgement: the write fails', thrown);
+  check('no acknowledgement: the next read asks the server', t.doc.remoteCache === undefined);
+
+  // what collaborators send: plain text, not the encoded lines of joinDoc
+  const hashOf = (text) => require('crypto').createHash('sha1').update('blob ' + text.length + '\x00' + text).digest('hex');
+  server = { text: 'one 中文Ã©–é end\n', version: 2 };
+  t = make(server);
+  await t.vfs.openFile(DOC_URI);
+  t.handlers.onFileChanged({ doc: 'doc1', v: 2, op: [{ p: 3, d: ' 中文Ã©–é end' }] });
+  check('receiving: a deletion of non-ASCII text removes exactly that text', t.doc.remoteCache === 'one\n', JSON.stringify(t.doc.remoteCache));
+  t.handlers.onFileChanged({ doc: 'doc1', v: 3, op: [{ p: 3, i: ' 疫苗é' }], hash: hashOf('one 疫苗é\n') });
+  check('receiving: an insertion arrives as it is, and its hash agrees', t.doc.remoteCache === 'one 疫苗é\n' && t.doc.version === 4, `${JSON.stringify(t.doc.remoteCache)} ${t.doc.version}`);
+  t.handlers.onFileChanged({ doc: 'doc1', v: 4, op: [{ p: 0, i: 'x' }], hash: 'something else' });
+  check('receiving: a hash that disagrees drops the cache', t.doc.remoteCache === undefined);
+
+  server = { text: 'Commented text.\n', version: 2 };
+  t = make(server);
+  await t.vfs.openFile(DOC_URI);
+  let commentEvents = 0;
+  const listening = EventBus.on('commentsChangedEvent', () => { commentEvents++; });
+  t.handlers.onFileChanged({ doc: 'doc1', v: 2, op: [{ c: 'Commented', p: 0, t: 'thread1' }] });
+  check('receiving: a new comment leaves the text alone', t.doc.remoteCache === 'Commented text.\n' && t.doc.version === 3);
+  check('receiving: a new comment is announced', commentEvents === 1, String(commentEvents));
+  t.handlers.onCommentsChanged();
+  check('receiving: so is a change to a thread', commentEvents === 2, String(commentEvents));
+  listening.dispose();
+
+  // handlers survive a new socket, as overleaf.com refuses the first kind of connection
+  let registered = 0, recreated = 0;
+  const vfs = Object.create(VirtualFileSystem.prototype);
+  vfs.socket = { needsReinit: false, init() { recreated++; this.needsReinit = false; }, updateEventHandlers: () => { registered++; } };
+  vfs.prepareSocket();
+  vfs.socket.needsReinit = true;
+  vfs.prepareSocket();
+  check('a new socket does not register the handlers a second time', registered === 1 && recreated === 1, `${registered} registered, ${recreated} recreated`);
 }
 
 // ---- the project living in overleaf/, next to other folders ----
@@ -538,6 +599,162 @@ async function testProjectFolder(LocalReplicaSCMProvider) {
   LocalReplicaSCMProvider.forgetProjectRoot();
 
   check('a project name becomes a safe folder name', LocalReplicaSCMProvider.sanitizeProjectFolderName('A/B: 论文?') === 'A_B_ 论文_', LocalReplicaSCMProvider.sanitizeProjectFolderName('A/B: 论文?'));
+}
+
+// ---- comments ----
+
+async function testComments({ ProjectComments, joinComments, locateQuote }) {
+  // the shapes are what overleaf.com returned for a real comment
+  const message = (content, overrides = {}) => ({ id: 'm', content, timestamp: 1793865710628, user_id: 'u', user: { id: 'u', first_name: 'Ada', last_name: 'Lovelace', email: 'ada@example.com' }, ...overrides });
+  const docRange = (id, ...comments) => ({ id, ranges: { comments: comments.map(([t, c, p]) => ({ id: t, op: { c, p, t }, metadata: { user_id: 'u', ts: '2026-11-05T08:01:52.837Z' } })) } });
+  const paths = new Map([['d1', 'main.tex'], ['d2', 'sections/a.tex']]);
+  let joined = joinComments(
+    [docRange('d2', ['t3', 'later', 9]), docRange('d1', ['t2', 'second', 20], ['t1', 'first', 5]), docRange('gone', ['t4', 'x', 0]), { id: 'd1', ranges: {} }],
+    { t1: { messages: [message('这里要改')] }, t2: { messages: [message('ok')], resolved: true }, t3: { messages: [message('hi', { user: { id: 'u', email: 'only@example.com' } })] }, t4: { messages: [message('x')] } },
+    paths,
+  );
+  check('join: comments are in document order, by file', joined.map((c) => c.threadId).join() === 't1,t2,t3', JSON.stringify(joined.map((c) => c.threadId)));
+  check('join: what was said, by whom, and where', joined[0].path === 'main.tex' && joined[0].quote === 'first' && joined[0].offset === 5 && joined[0].messages[0].text === '这里要改' && joined[0].messages[0].author === 'Ada Lovelace', JSON.stringify(joined[0]));
+  check('join: a resolved thread is marked', joined[1].resolved === true && joined[0].resolved === false);
+  check('join: a person without a name shows as their email', joined[2].messages[0].author === 'only@example.com');
+  joined = joinComments([docRange('d1', ['t1', 'x', 0])], { t1: { messages: [] } }, paths);
+  check('join: a comment with nothing said yet is left out', joined.length === 0);
+  joined = joinComments([docRange('d1', ['t1', 'x', 0])], {}, paths);
+  check('join: so is one whose thread is gone', joined.length === 0);
+
+  check('locate: where it was', locateQuote('a target b', 'target', 2) === 2);
+  check('locate: moved later', locateQuote('xx a target b', 'target', 2) === 5);
+  check('locate: moved earlier', locateQuote('target b', 'target', 4) === 0);
+  check('locate: the nearest of several', locateQuote('target ......... target ...', 'target', 12) === 17 && locateQuote('target ...... target ...........', 'target', 3) === 0);
+  check('locate: gone', locateQuote('nothing here', 'target', 2) === undefined);
+  check('locate: a comment on deleted text stays where it was', locateQuote('short', '', 3) === 3 && locateQuote('short', '', 99) === 5);
+
+  // the real class, with real files and editors
+  const folder = path.join(workspaceRoot(), 'with comments');
+  fs.mkdirSync(path.join(folder, 'sections'), { recursive: true });
+  const main = path.join(folder, 'main.tex');
+  const later = path.join(folder, 'sections', 'later.tex');
+  const output = path.join(folder, '.output', 'comments.md');
+  const put = (file, text) => fs.writeFileSync(file, text, 'utf8');
+  const listing = () => (fs.existsSync(output) ? fs.readFileSync(output, 'utf8') : '');
+  const comment = (threadId, quote, offset, overrides = {}) => ({ threadId, path: 'main.tex', quote, offset, resolved: false, messages: [{ author: 'Ada Lovelace', text: '这里要改', time: 1793865710628 }], ...overrides });
+  const emitter = new vscode.EventEmitter();
+  const source = {
+    onDidChangeComments: emitter.event,
+    comments: [],
+    reads: 0,
+    failing: false,
+    async readComments() {
+      this.reads++;
+      if (this.failing) throw new Error('no connection');
+      return this.comments;
+    },
+  };
+  const logged = [];
+  put(main, 'first line\nb 疫苗 target here\n');
+  source.comments = [comment('t1', 'target', 'first line\nb 疫苗 '.length)];
+  const comments = new ProjectComments(vscode.Uri.file(folder), 'My Paper', source, (m) => logged.push(m));
+  await comments.start();
+  const thread = (id) => comments.shown.get(id)?.thread;
+  const rangeIs = (id, startLine, startCharacter, endLine, endCharacter) => {
+    const range = thread(id)?.range;
+    return !!range && range.start.line === startLine && range.start.character === startCharacter && range.end.line === endLine && range.end.character === endCharacter;
+  };
+  const shownRange = (id) => JSON.stringify(thread(id)?.range);
+
+  check('comments: shown on the commented text, counting Chinese as the editor does', rangeIs('t1', 1, 5, 1, 11), shownRange('t1'));
+  check('comments: they cannot be replied to here, so no box invites it', thread('t1').canReply === false);
+  check('comments: collapsed, so they do not push the text apart', thread('t1').collapsibleState === vscode.CommentThreadCollapsibleState.Collapsed);
+  check('comments: the thread shows who said what', thread('t1').comments.length === 1 && thread('t1').comments[0].author.name === 'Ada Lovelace' && thread('t1').comments[0].body === '这里要改');
+  let text = listing();
+  check('comments: a plain file names the project', text.includes('# Overleaf comments: My Paper'), text);
+  check('comments: and gives the place, the text and the words', text.includes('### main.tex, line 2') && text.includes('> target') && text.includes('Ada Lovelace') && text.includes('这里要改'), text);
+  check('comments: the file does not carry email addresses', !text.includes('@'), text);
+  check('comments: the output folder stays out of git', fs.readFileSync(path.join(folder, '.output', '.gitignore'), 'utf8') === '*\n');
+
+  // any tool editing the file
+  const readsAtStart = source.reads;
+  put(main, 'new line\nfirst line\nb 疫苗 target here\n');
+  check('comments: an edit on the disk moves the comment', await until(() => rangeIs('t1', 2, 5, 2, 11)), shownRange('t1'));
+  check('comments: and the plain file', await until(() => listing().includes('### main.tex, line 3')), listing());
+  check('comments: following the text needs no request', source.reads === readsAtStart, String(source.reads));
+  put(main, 'first line\r\nnew\r\nb 疫苗 target here\r\n');
+  await until(() => rangeIs('t1', 2, 5, 2, 11));
+  check('comments: a file with CRLF line endings counts the same', rangeIs('t1', 2, 5, 2, 11), shownRange('t1'));
+
+  // typing that has not been saved
+  put(main, 'first line\nb 疫苗 target here\n');
+  await until(() => rangeIs('t1', 1, 5, 1, 11));
+  const document = await vscode.workspace.openTextDocument(main);
+  const edit = new vscode.WorkspaceEdit();
+  edit.insert(document.uri, new vscode.Position(0, 0), 'typed\n');
+  await vscode.workspace.applyEdit(edit);
+  check('comments: unsaved typing moves the comment', await until(() => rangeIs('t1', 2, 5, 2, 11)), shownRange('t1'));
+  await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor').then(undefined, () => {});
+  const undo = new vscode.WorkspaceEdit();
+  undo.delete(document.uri, new vscode.Range(0, 0, 1, 0));
+  await vscode.workspace.applyEdit(undo);
+  await document.save();
+  await until(() => rangeIs('t1', 1, 5, 1, 11));
+
+  // what only Overleaf knows
+  const readsBefore = source.reads;
+  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length)];
+  put(main, 'first line\nb 疫苗 tar here\n');
+  check('comments: when the commented text changes, Overleaf is asked again', await until(() => source.reads > readsBefore, 12000), String(source.reads));
+  check('comments: and what it says is shown', await until(() => rangeIs('t1', 1, 5, 1, 8)), shownRange('t1'));
+  source.comments = [comment('t1', 'gone', 3)];
+  emitter.fire();
+  check('comments: if the text is not found the file says so', await until(() => listing().includes('near line 1 (the commented text has changed)')), listing());
+  check('comments: and the comment stays near where it was', await until(() => rangeIs('t1', 0, 3, 0, 3)), shownRange('t1'));
+
+  // changes on Overleaf
+  source.comments = [
+    comment('t1', 'tar', 'first line\nb 疫苗 '.length, { messages: [{ author: 'Ada Lovelace', text: 'one', time: 1 }, { author: 'Bob', text: 'two', time: 2 }] }),
+    comment('t2', 'first', 0),
+  ];
+  emitter.fire();
+  check('comments: a new comment appears', await until(() => !!thread('t2')));
+  check('comments: a reply appears', await until(() => thread('t1')?.comments.length === 2 && thread('t1').comments[1].body === 'two'));
+  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length), comment('t2', 'first', 0, { resolved: true })];
+  emitter.fire();
+  check('comments: a resolved comment leaves the text', await until(() => !thread('t2')));
+  check('comments: and is listed as resolved', await until(() => listing().includes('## Open (1)') && listing().includes('## Resolved (1)')), listing());
+  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length)];
+  emitter.fire();
+  check('comments: a deleted comment is gone', await until(() => listing().includes('## Resolved (0)')), listing());
+
+  // a file that has not arrived yet
+  source.comments = [comment('t3', 'arrives', 2, { path: 'sections/later.tex' })];
+  emitter.fire();
+  check('comments: a comment in a file not here yet is listed by its file', await until(() => listing().includes('### sections/later.tex\n')), listing());
+  check('comments: but cannot be shown yet', !thread('t3'));
+  put(later, 'x arrives\n');
+  check('comments: it is shown when the file arrives', await until(() => rangeIs('t3', 0, 2, 0, 9)), shownRange('t3'));
+  check('comments: the file is linked to the right path', thread('t3').uri.path.endsWith('/sections/later.tex'), thread('t3').uri.path);
+
+  put(later, '\nx arrives\n');
+  source.comments = [comment('t3', '', 0, { path: 'sections/later.tex' })];
+  emitter.fire();
+  check('comments: a comment at the very start of a file that begins with an empty line', await until(() => rangeIs('t3', 0, 0, 0, 0)), shownRange('t3'));
+
+  // no connection
+  source.failing = true;
+  emitter.fire();
+  await until(() => logged.some((m) => m.includes('no connection')));
+  check('comments: a failed read is recorded', logged.some((m) => m.includes('Could not read the comments: no connection')), JSON.stringify(logged));
+  check('comments: and what is showing stays', !!thread('t3'));
+  source.failing = false;
+
+  comments.dispose();
+  const finalText = listing();
+  put(later, 'y\nx arrives\n');
+  source.comments = [];
+  emitter.fire();
+  await sleep(SETTLE_MS);
+  check('comments: nothing is written after stopping', listing() === finalText);
+  emitter.dispose();
+  fs.rmSync(folder, { recursive: true, force: true });
 }
 
 // ---- working next to LaTeX Workshop ----
@@ -662,6 +879,7 @@ exports.run = async function () {
     const { GlobalStateManager } = require(path.join(out, 'utils', 'globalStateManager.js'));
     testMerge(merge);
     await testReplaceDocContent(VirtualFileSystem, GlobalStateManager);
+    await testComments(require(path.join(out, 'sync', 'comments.js')));
     await testSync(FolderSync);
   } catch (e) {
     results.push(`ERROR ${e && e.stack}`);

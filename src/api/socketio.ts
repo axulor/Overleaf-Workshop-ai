@@ -42,6 +42,8 @@ export interface UpdateSchema {
         i?: string, //insert
         d?: string, //delete
         u?: boolean, //isUndo
+        c?: string, //comment: the commented text
+        t?: string, //comment: its thread id
     }[],
     v: number, //doc version number
     lastV?: number, //last version number
@@ -66,6 +68,7 @@ export interface EventsHandler {
     onClientDisconnected?: (id:string) => void,
     //
     onReceivedMessage?: (message:ProjectMessageResponseSchema) => void,
+    onCommentsChanged?: () => void,
     //
     onSpellCheckLanguageUpdated?: (language:string) => void,
     onCompilerUpdated?: (compiler:string) => void,
@@ -304,6 +307,11 @@ export class SocketIOAPI {
                 case handlers.onReceivedMessage:
                     this.socket.on('new-chat-message', (message:ProjectMessageResponseSchema) => {
                         handler(message);
+                    });
+                    break;
+                case handlers.onCommentsChanged:
+                    ['new-comment', 'edit-message', 'delete-message', 'resolve-thread', 'reopen-thread', 'delete-thread'].forEach((event) => {
+                        this.socket.on(event, () => handler());
                     });
                     break;
                 case handlers.onSpellCheckLanguageUpdated:

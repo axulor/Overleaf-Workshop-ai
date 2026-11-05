@@ -13,6 +13,7 @@ export type Events = {
     'socketioConnectedEvent': {publicId:string},
     'projectJoinedEvent': {projectId:string},
     'projectDisconnectedEvent': {projectId:string},
+    'commentsChangedEvent': {projectId:string},
 };
 
 export class EventBus {

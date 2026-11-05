@@ -37,6 +37,24 @@ export interface DocumentEntity extends FileEntity {
     /** An update of ours is on its way to the server, and someone else's arrived meanwhile. */
     sendingUpdate?: boolean,
     changedWhileSending?: boolean,
+    /** Ends the wait for the server to apply the update of ours that is on its way. */
+    acknowledged?: () => void,
+}
+
+const ACK_TIMEOUT_MS = 5000;
+
+/** The hash Overleaf uses to check a document's text. Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288 */
+function hashDocText(text: string): string {
+    return require('crypto').createHash('sha1').update("blob " + text.length + "\x00" + text).digest('hex');
+}
+
+/** Each op applies to the result of the one before it. Ops carry plain text, unlike the encoded lines of joinDoc. */
+function applyOpsToText(text: string, ops: NonNullable<UpdateSchema['op']>): string {
+    return ops.reduce((result, op) => {
+        if (op.i) { return result.slice(0, op.p) + op.i + result.slice(op.p); }
+        if (op.d) { return result.slice(0, op.p) + result.slice(op.p + op.d.length); }
+        return result; // a comment does not change the text
+    }, text);
 }
 
 export interface FileRefEntity extends FileEntity {
@@ -214,7 +232,6 @@ export class VirtualFileSystem extends vscode.Disposable {
                     vscode.commands.executeCommand("workbench.action.reloadWindow");
                 } else if (choice === vscode.l10n.t('Retry')) {
                     this.retryConnection = 0;
-                    this.handlersRegistered = false;
                     this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
                     this.initializing = this.initializingPromise;
                     this.init().catch(() => {});
@@ -255,20 +272,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 await new Promise(resolve => setTimeout(resolve, delayMs));
             }
 
-            // Only recreate the socket when the connection scheme has changed
-            // (e.g., v1→v2 after connectionRejected). For transient disconnects,
-            // socket.io's built-in auto-reconnect handles re-establishing the TCP
-            // connection without creating a new one — avoiding TCP RST packets.
-            if (this.socket.needsReinit) {
-                this.socket.init();
-                this.handlersRegistered = false;
-            }
-
-            // Register event handlers once on the current socket
-            if (!this.handlersRegistered) {
-                this.remoteWatch();
-                this.handlersRegistered = true;
-            }
+            this.prepareSocket();
 
             this.root = undefined;
             return this.socket.joinProject(this.projectId).then(async (project) => {
@@ -318,6 +322,23 @@ export class VirtualFileSystem extends vscode.Disposable {
         return attemptReconnect();
     }
 
+    private prepareSocket() {
+        // Only recreate the socket when the connection scheme has changed
+        // (e.g., v1→v2 after connectionRejected). For transient disconnects,
+        // socket.io's built-in auto-reconnect handles re-establishing the TCP
+        // connection without creating a new one — avoiding TCP RST packets.
+        if (this.socket.needsReinit) {
+            this.socket.init();
+        }
+
+        // A new socket takes over the handlers of the old one, so they are registered only once.
+        // Registering again would handle every update twice, and the second time looks out of step.
+        if (!this.handlersRegistered) {
+            this.remoteWatch();
+            this.handlersRegistered = true;
+        }
+    }
+
     get isInvisibleMode() {
         return this.socket.isUsingAlternativeConnectionScheme;
     }
@@ -325,7 +346,6 @@ export class VirtualFileSystem extends vscode.Disposable {
     toggleInvisibleMode() {
         // Clear disconnect debounce to prevent false retry trigger during mode switch
         this.lastDisconnectTime = 0;
-        this.handlersRegistered = false; // Will re-register on the new socket scheme
         if (this.retryTimer) {
             clearTimeout(this.retryTimer);
             this.retryTimer = undefined;
@@ -530,26 +550,29 @@ export class VirtualFileSystem extends vscode.Disposable {
                     ]);
                 }
             },
+            onCommentsChanged: () => {
+                EventBus.fire('commentsChangedEvent', {projectId: this.projectId});
+            },
             onFileChanged: (update:UpdateSchema) => {
                 const res = this._resolveById(update.doc);
                 if (res===undefined) { return; }
+                if (update.op?.some((op) => op.t!==undefined)) {
+                    EventBus.fire('commentsChangedEvent', {projectId: this.projectId});
+                }
 
                 const doc = res.fileEntity as DocumentEntity;
-                if (update.v===doc.version) {
-                    doc.version += 1;
+                const content = update.op && doc.remoteCache!==undefined ? applyOpsToText(doc.remoteCache, update.op) : undefined;
+                // An update can carry a hash of the text it leads to, which shows whether the cache is what the server has.
+                const inStep = update.v===doc.version && (content===undefined || !update.hash || hashDocText(content)===update.hash);
+                if (inStep) {
+                    doc.version = update.v + 1;
                     if (update.op && doc.sendingUpdate) {
                         doc.changedWhileSending = true;
                     }
-                    if (update.op && doc.remoteCache!==undefined) {
-                        let content = doc.remoteCache;
-                        update.op.forEach((op) => {
-                            if (op.i) {
-                                content = content.slice(0, op.p) + op.i + content.slice(op.p);
-                            } else if (op.d) {
-                                const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
-                                content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
-                            }
-                        });
+                    if (!update.op) {
+                        doc.acknowledged?.(); // an update without an op is the server accepting ours
+                    }
+                    if (content!==undefined) {
                         const _uri = this.pathToUri(res.path).toString();
                         const _doc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString()===_uri);
                         // if doc dirty, local cache should diverge from remote cache
@@ -567,6 +590,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     if (doc.sendingUpdate) {
                         doc.changedWhileSending = true;
                     }
+                    doc.acknowledged?.();
                     this.notify([
                         {type: vscode.FileChangeType.Changed, uri: this.pathToUri(res.path)}
                     ]);
@@ -954,19 +978,29 @@ export class VirtualFileSystem extends vscode.Disposable {
         // Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288
         if (!doc.mtime || Date.now()-doc.mtime>5000) {
             doc.mtime = Date.now();
-            update.hash = require('crypto').createHash('sha1').update("blob " + text.length + "\x00" + text).digest('hex');
+            update.hash = hashDocText(text);
         }
 
         doc.sendingUpdate = true;
         doc.changedWhileSending = false;
+        // The server replies when it has queued the update, and acknowledges later when it has applied it.
+        // Only then is the version known, and sending the next update before that would apply it in the wrong place.
+        // (Invisible mode only collects changes for later, so it has nothing to acknowledge.)
+        let ackTimer: NodeJS.Timeout | undefined;
+        const acknowledgement = this.isInvisibleMode ? Promise.resolve() : new Promise<void>((resolve, reject) => {
+            doc.acknowledged = resolve;
+            ackTimer = setTimeout(() => reject(new Error('Overleaf did not acknowledge the update in time')), ACK_TIMEOUT_MS);
+        });
         try {
-            await this.socket.applyOtUpdate(doc._id, update);
+            await Promise.all([this.socket.applyOtUpdate(doc._id, update), acknowledgement]);
         } catch (error) {
             // It may or may not have been applied, so the only trustworthy version is the server's.
             doc.remoteCache = undefined;
             doc.localCache = undefined;
             throw error;
         } finally {
+            clearTimeout(ackTimer);
+            doc.acknowledged = undefined;
             doc.sendingUpdate = false;
         }
 
@@ -1416,6 +1450,19 @@ export class VirtualFileSystem extends vscode.Disposable {
         } else {
             return false;
         }
+    }
+
+    /** The project's comments as Overleaf keeps them: where they are, and separately what was said. */
+    async getComments() {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const [ranges, threads] = await Promise.all([
+            this.api.getDocRanges(identity, this.projectId),
+            this.api.getCommentThreads(identity, this.projectId),
+        ]);
+        if (ranges.type!=='success' || threads.type!=='success') {
+            throw new Error(ranges.message ?? threads.message ?? 'Overleaf did not return the comments');
+        }
+        return {docRanges: ranges.docRanges ?? [], threads: threads.threads ?? {}};
     }
 }
 

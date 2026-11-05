@@ -170,6 +170,24 @@ export interface ProjectMessageResponseSchema {
     clientId: string,
 }
 
+export interface CommentThreadSchema {
+    messages?: {
+        id: string,
+        content: string,
+        timestamp: number,
+        user_id: string,
+        user?: {id:string, first_name?:string, last_name?:string, email?:string},
+    }[],
+    resolved?: boolean,
+}
+
+export interface DocRangesSchema {
+    id: string, //doc id
+    ranges?: {
+        comments?: {id:string, op:{c:string, p:number, t:string}}[], //c: the commented text, p: its offset, t: the thread
+    },
+}
+
 export interface ProjectSettingsSchema {
     learnedWords: string[],
     languages: {code:string, name:string}[],
@@ -198,6 +216,8 @@ export interface ResponseSchema {
     treeDiff?: ProjectFileTreeDiffResponseSchema;
     messages?: ProjectMessageResponseSchema[];
     settings?: ProjectSettingsSchema;
+    threads?: {[threadId:string]: CommentThreadSchema};
+    docRanges?: DocRangesSchema[];
 }
 
 export class BaseAPI {
@@ -926,5 +946,21 @@ export class BaseAPI {
     async sendMessage(identity:Identity, projectId:string, client_id:string, content:string) {
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/messages`, {client_id, content}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    /** What was said in each comment thread of a project. */
+    async getCommentThreads(identity:Identity, projectId:string) {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/threads`, undefined, (res) => {
+            return {threads: JSON.parse(res!) as {[threadId:string]: CommentThreadSchema}};
+        }, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    /** Where the comments of each document are. */
+    async getDocRanges(identity:Identity, projectId:string) {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/ranges`, undefined, (res) => {
+            return {docRanges: JSON.parse(res!) as DocRangesSchema[]};
+        }, {'X-Csrf-Token': identity.csrfToken});
     }
 }
