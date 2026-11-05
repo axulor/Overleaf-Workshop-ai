@@ -43,6 +43,10 @@ export class FolderSyncManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.sync.addComment`, (reply: vscode.CommentReply) => this.comments?.submit(reply)),
             vscode.commands.registerCommand(`${ROOT_NAME}.sync.replyComment`, (reply: vscode.CommentReply) => this.comments?.submit(reply)),
             vscode.commands.registerCommand(`${ROOT_NAME}.sync.addCommentOnSelection`, () => vscode.commands.executeCommand('workbench.action.addComment')),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.editComment`, (comment) => this.comments?.startEditing(comment)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.saveEditedComment`, (comment) => this.comments?.saveEditing(comment)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.cancelEditingComment`, (comment) => this.comments?.cancelEditing(comment)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.deleteComment`, (comment) => this.comments?.delete(comment)),
         ];
     }
 

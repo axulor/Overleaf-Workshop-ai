@@ -652,7 +652,7 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
     paths,
   );
   check('join: comments are in document order, by file', joined.map((c) => c.threadId).join() === 't1,t2,t3', JSON.stringify(joined.map((c) => c.threadId)));
-  check('join: what was said, by whom, and where', joined[0].path === 'main.tex' && joined[0].docId === 'd1' && joined[0].quote === 'first' && joined[0].offset === 5 && joined[0].messages[0].text === '这里要改' && joined[0].messages[0].author === 'Ada Lovelace', JSON.stringify(joined[0]));
+  check('join: what was said, by whom, and where', joined[0].path === 'main.tex' && joined[0].docId === 'd1' && joined[0].quote === 'first' && joined[0].offset === 5 && joined[0].messages[0].text === '这里要改' && joined[0].messages[0].author === 'Ada Lovelace' && joined[0].messages[0].id === 'm' && joined[0].messages[0].authorId === 'u', JSON.stringify(joined[0]));
   check('join: a resolved thread is marked', joined[1].resolved === true && joined[0].resolved === false);
   check('join: a person without a name shows as their email', joined[2].messages[0].author === 'only@example.com');
   joined = joinComments([docRange('d1', ['t1', 'x', 0])], { t1: { messages: [] } }, paths);
@@ -677,32 +677,70 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   const listing = () => (fs.existsSync(output) ? fs.readFileSync(output, 'utf8') : '');
   const comment = (threadId, quote, offset, overrides = {}) => ({ threadId, docId: 'doc-of-main', path: 'main.tex', quote, offset, resolved: false, messages: [{ author: 'Ada Lovelace', text: '这里要改', time: 1793865710628 }], ...overrides });
   const emitter = new vscode.EventEmitter();
+  // Behaves like a small Overleaf: what it is told shows in what it answers. A read answers with what it had when asked.
   const source = {
     onDidChangeComments: emitter.event,
     comments: [],
     reads: 0,
     failing: false,
+    refuse: false,
+    listNewComments: true,
+    nextId: 100,
+    changes: [],
+    added: [],
+    replies: [],
+    edits: [],
+    deletedMessages: [],
+    deletedComments: [],
+    sentOrder: [],
+    async currentUser() { return { id: 'me', name: '我自己' }; },
     async readComments() {
       this.reads++;
       if (this.failing) throw new Error('no connection');
-      return this.comments;
+      const answer = JSON.parse(JSON.stringify(this.comments));
+      if (this.holdRead) await this.holdRead;
+      return answer;
     },
-    changes: [],
-    refuse: false,
+    async gate(name) {
+      if (this.hold) await this.hold;
+      if (this.refuse) throw new Error('403: not allowed');
+      this.sentOrder.push(name);
+    },
+    listed(threadId) { return this.comments.find((c) => c.threadId === threadId); },
+    newMessage(text) { return { id: `m${this.nextId++}`, authorId: 'me', author: '我自己', text, time: 1793865710628 }; },
     async setCommentResolved(target, resolved) {
-      if (this.refuse) throw new Error('403: not allowed');
+      await this.gate('resolve');
       this.changes.push({ threadId: target.threadId, docId: target.docId, resolved });
+      const listed = this.listed(target.threadId);
+      if (listed) listed.resolved = resolved;
     },
-    added: [],
-    replies: [],
-    async addComment(file, quote, offset, text) {
-      if (this.refuse) throw new Error('403: not allowed');
-      this.added.push({ file, quote, offset, text });
-      return 'new-thread';
+    async addComment(threadId, file, quote, offset, text) {
+      await this.gate('add');
+      this.added.push({ threadId, file, quote, offset, text });
+      if (this.listNewComments) this.comments.push({ threadId, docId: 'doc-of-main', path: file, quote, offset, resolved: false, messages: [this.newMessage(text)] });
+      return 'doc-of-main';
     },
     async addReply(target, text) {
-      if (this.refuse) throw new Error('403: not allowed');
+      await this.gate('reply');
       this.replies.push({ threadId: target.threadId, text });
+      this.listed(target.threadId)?.messages.push(this.newMessage(text));
+    },
+    async editMessage(target, messageId, text) {
+      await this.gate('edit');
+      this.edits.push({ threadId: target.threadId, messageId, text });
+      const message = this.listed(target.threadId)?.messages.find((m) => m.id === messageId);
+      if (message) message.text = text;
+    },
+    async deleteMessage(target, messageId) {
+      await this.gate('deleteMessage');
+      this.deletedMessages.push({ threadId: target.threadId, messageId });
+      const listed = this.listed(target.threadId);
+      if (listed) listed.messages = listed.messages.filter((m) => m.id !== messageId);
+    },
+    async deleteComment(target) {
+      await this.gate('deleteComment');
+      this.deletedComments.push({ threadId: target.threadId, docId: target.docId });
+      this.comments = this.comments.filter((c) => c.threadId !== target.threadId);
     },
   };
   const logged = [];
@@ -794,61 +832,238 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   emitter.fire();
   check('comments: a comment at the very start of a file that begins with an empty line', await until(() => rangeIs('t3', 0, 0, 0, 0)), shownRange('t3'));
 
-  // resolving here
+  // ---- what the user does shows at once, and is sent afterwards ----
   const errors = [];
-  comments.showError = (m) => errors.push(m);
-  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length), comment('t2', 'first', 0)];
-  emitter.fire();
-  await until(() => !!thread('t1') && !!thread('t2'));
-  const threadOne = thread('t1');
-  await comments.resolve(threadOne);
-  check('resolving: Overleaf is told which comment, in which document', source.changes.length === 1 && source.changes[0].threadId === 't1' && source.changes[0].docId === 'doc-of-main' && source.changes[0].resolved === true, JSON.stringify(source.changes));
-  check('resolving: the comment leaves the text at once', !thread('t1') && !!thread('t2'));
-  check('resolving: and is listed as resolved', listing().includes('## Open (1)') && listing().includes('## Resolved (1)'), listing());
+  const retries = [];
+  comments.showError = (m, retry) => { errors.push(m); retries.push(retry); };
+  const clearErrors = () => { errors.length = 0; retries.length = 0; };
+  let release = () => {};
+  const hold = () => { source.hold = new Promise((resolve) => { release = () => { source.hold = undefined; resolve(); }; }); };
+  const firstOfT = (id) => source.comments.find((c) => c.threadId === id);
+  const bodies = (id) => thread(id)?.comments.map((c) => c.body);
+  const mine = (id, text) => ({ id, authorId: 'me', author: '我自己', text, time: 1793865710628 });
+  const theirs = (id, text) => ({ id, authorId: 'them', author: 'Bob', text, time: 1793865710628 });
+  const tarOffset = 'first line\nb 疫苗 '.length;
+  const refreshed = async () => {
+    const before = source.reads;
+    emitter.fire();
+    await until(() => source.reads > before);
+    await sleep(100);
+  };
+  source.comments = [
+    comment('t1', 'tar', tarOffset, { messages: [mine('m1', 'one')] }),
+    comment('t2', 'first', 0, { messages: [theirs('m2', 'two')] }),
+  ];
+  await refreshed();
+  check('setup: two comments are showing', !!thread('t1') && !!thread('t2'));
 
-  // Overleaf announces it too, and what it says then still holds
-  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length, { resolved: true }), comment('t2', 'first', 0)];
-  emitter.fire();
-  await sleep(SETTLE_MS);
-  check('resolving: the announcement changes nothing more', !thread('t1') && !!thread('t2'));
+  // resolving
+  hold();
+  comments.resolve(thread('t1'));
+  check('resolving: the comment leaves the text at once, while the server has not answered', !thread('t1') && !!thread('t2') && source.changes.length === 0, JSON.stringify(source.changes));
+  check('resolving: the plain file follows', await until(() => listing().includes('## Open (1)') && listing().includes('## Resolved (1)')), listing());
+  release();
+  await comments.whenSent();
+  check('resolving: then Overleaf is told which comment, in which document', source.changes.length === 1 && source.changes[0].threadId === 't1' && source.changes[0].docId === 'doc-of-main' && source.changes[0].resolved === true, JSON.stringify(source.changes));
+  await refreshed();
+  check('resolving: what Overleaf says afterwards changes nothing more', !thread('t1') && !!thread('t2'));
 
+  // reopening
   comments.pickComment = async (candidates) => {
     source.offered = candidates.map((c) => c.threadId);
     return candidates[0];
   };
+  hold();
   await comments.reopen();
   check('reopening: only resolved comments are offered', source.offered.join() === 't1', JSON.stringify(source.offered));
-  check('reopening: Overleaf is told', source.changes.length === 2 && source.changes[1].threadId === 't1' && source.changes[1].resolved === false, JSON.stringify(source.changes));
-  check('reopening: the comment is back on the text', !!thread('t1') && rangeIs('t1', 1, 5, 1, 8), shownRange('t1'));
-  source.comments = [comment('t1', 'tar', 'first line\nb 疫苗 '.length), comment('t2', 'first', 0)];
-  emitter.fire();
-  await until(() => listing().includes('## Resolved (0)'));
-
+  check('reopening: the comment is back on the text at once', !!thread('t1') && rangeIs('t1', 1, 5, 1, 8) && source.changes.length === 1, shownRange('t1'));
+  release();
+  await comments.whenSent();
+  check('reopening: then Overleaf is told', source.changes.length === 2 && source.changes[1].threadId === 't1' && source.changes[1].resolved === false, JSON.stringify(source.changes));
   comments.pickComment = async () => undefined;
-  const changesBefore = source.changes.length;
+  await refreshed();
+  firstOfT('t1').resolved = true;
+  await refreshed();
   await comments.reopen();
-  check('reopening: closing the list changes nothing', source.changes.length === changesBefore);
+  await comments.whenSent();
+  check('reopening: closing the list changes nothing', source.changes.length === 2 && !thread('t1'));
+  firstOfT('t1').resolved = false;
+  await refreshed();
 
+  // what Overleaf said before a change must not undo it
+  let answerHeld;
+  source.holdRead = new Promise((resolve) => { answerHeld = resolve; });
+  let reads = source.reads;
+  emitter.fire();
+  await until(() => source.reads > reads);
+  comments.resolve(thread('t1'));
+  await comments.whenSent();
+  answerHeld();
+  source.holdRead = undefined;
+  await sleep(200);
+  check('a slow read: an answer from before a change does not undo it', !thread('t1'));
+  check('a slow read: and the comments are read again', await until(() => source.reads > reads + 1), String(source.reads));
+
+  // a read while something is being sent would not include it
+  firstOfT('t1').resolved = false;
+  await refreshed();
+  hold();
+  comments.resolve(thread('t1'));
+  reads = source.reads;
+  emitter.fire();
+  await sleep(800);
+  check('while sending: comments are not read', source.reads === reads, `${source.reads} ${reads}`);
+  check('while sending: and the change stays', !thread('t1'));
+  release();
+  await comments.whenSent();
+  check('after sending: comments are read', await until(() => source.reads > reads), String(source.reads));
+  firstOfT('t1').resolved = false;
+  await refreshed();
+
+  // Overleaf refusing
+  clearErrors();
   source.refuse = true;
-  await comments.resolve(thread('t2'));
-  check('refused: the comment stays', !!thread('t2'));
-  check('refused: and the user is told why', errors.length === 1 && errors[0].includes('403'), JSON.stringify(errors));
+  comments.resolve(thread('t1'));
+  check('refused: at first the comment leaves', !thread('t1'));
+  await comments.whenSent();
+  check('refused: then it comes back', !!thread('t1'));
+  check('refused: and the user is told why, with a way to try again', errors.length === 1 && errors[0].includes('403') && typeof retries[0] === 'function', JSON.stringify(errors));
   source.refuse = false;
+  retries[0]();
+  check('refused: trying again shows it at once', !thread('t1'));
+  await comments.whenSent();
+  check('refused: and goes through', firstOfT('t1').resolved === true);
+  firstOfT('t1').resolved = false;
+  await refreshed();
 
-  // replying here
-  const repliedReads = source.reads;
+  // ---- replying ----
+  hold();
   await comments.submit({ thread: thread('t2'), text: '  同意  ' });
-  check('replying: Overleaf is told which comment, and the words without stray spaces', source.replies.length === 1 && source.replies[0].threadId === 't2' && source.replies[0].text === '同意', JSON.stringify(source.replies));
-  check('replying: the thread is read again, to show the reply', source.reads > repliedReads);
+  check('replying: the button returns while the server has not answered, so the box clears at once', source.replies.length === 0);
+  check('replying: the reply shows at once, without stray spaces', bodies('t2').join() === 'two,同意', JSON.stringify(bodies('t2')));
+  check('replying: under the user\'s own name', thread('t2').comments[1].author.name === '我自己', thread('t2').comments[1].author.name);
+  check('replying: it cannot be edited until Overleaf has given it an id', thread('t2').comments[1].contextValue === undefined);
+  release();
+  await comments.whenSent();
+  check('replying: then Overleaf is told', source.replies.length === 1 && source.replies[0].threadId === 't2' && source.replies[0].text === '同意', JSON.stringify(source.replies));
+  check('replying: and when it is listed it can be edited', await until(() => thread('t2').comments[1]?.contextValue === 'mine'), String(thread('t2').comments[1]?.contextValue));
+  check('replying: someone else\'s comment cannot', thread('t2').comments[0].contextValue === undefined);
+  const repliesBefore = source.replies.length;
   await comments.submit({ thread: thread('t2'), text: '   ' });
-  check('replying: nothing written, nothing sent', source.replies.length === 1);
-  errors.length = 0;
+  check('replying: nothing written, nothing sent', source.replies.length === repliesBefore && bodies('t2').length === 2);
+  clearErrors();
   source.refuse = true;
-  await comments.submit({ thread: thread('t2'), text: 'no' });
+  await comments.submit({ thread: thread('t2'), text: '发不出去' });
+  check('replying refused: at first it shows', bodies('t2').includes('发不出去'));
+  await comments.whenSent();
+  check('replying refused: then it is gone', !bodies('t2').includes('发不出去'));
+  check('replying refused: and what was written is in the message', errors.length === 1 && errors[0].includes('发不出去') && errors[0].includes('403'), JSON.stringify(errors));
   source.refuse = false;
-  check('replying: a refusal is explained', errors.length === 1 && errors[0].includes('403'), JSON.stringify(errors));
+  await refreshed();
 
-  // adding here, the way VS Code offers it: an empty thread on a place, with a box
+  // ---- editing ----
+  const myReply = () => thread('t2').comments.find((c) => c.messageId === source.comments.find((s) => s.threadId === 't2').messages[1].id);
+  let target = myReply();
+  comments.startEditing(target);
+  check('editing: the comment turns into a box', myReply().mode === vscode.CommentMode.Editing);
+  firstOfT('t2').messages[0].text = 'two, changed by Bob';
+  await refreshed();
+  check('editing: news from Overleaf does not take the box away', thread('t2').comments.includes(target) && target.mode === vscode.CommentMode.Editing);
+  target.body = '改过的';
+  hold();
+  comments.saveEditing(target);
+  check('editing: the new words show at once, while the server has not answered', bodies('t2')[1] === '改过的' && thread('t2').comments[1].mode === vscode.CommentMode.Preview && source.edits.length === 0, JSON.stringify(bodies('t2')));
+  check('editing: and what came meanwhile too', bodies('t2')[0] === 'two, changed by Bob', JSON.stringify(bodies('t2')));
+  check('editing: the plain file follows', await until(() => listing().includes('改过的')), listing());
+  release();
+  await comments.whenSent();
+  check('editing: then Overleaf is told', source.edits.length === 1 && source.edits[0].threadId === 't2' && source.edits[0].text === '改过的' && source.edits[0].messageId === target.messageId, JSON.stringify(source.edits));
+  await refreshed();
+
+  target = myReply();
+  comments.startEditing(target);
+  target.body = '不要了';
+  comments.cancelEditing(target);
+  check('editing: cancelling brings back the words', bodies('t2')[1] === '改过的' && thread('t2').comments[1].mode === vscode.CommentMode.Preview, JSON.stringify(bodies('t2')));
+  target = myReply();
+  comments.startEditing(target);
+  comments.saveEditing(target);
+  target = myReply();
+  comments.startEditing(target);
+  target.body = '   ';
+  comments.saveEditing(target);
+  await comments.whenSent();
+  check('editing: saving the same words, or none, sends nothing', source.edits.length === 1 && bodies('t2')[1] === '改过的', JSON.stringify(source.edits));
+
+  clearErrors();
+  source.refuse = true;
+  target = myReply();
+  comments.startEditing(target);
+  target.body = '改不了';
+  comments.saveEditing(target);
+  check('editing refused: at first it shows', bodies('t2')[1] === '改不了');
+  await comments.whenSent();
+  check('editing refused: then the old words are back', bodies('t2')[1] === '改过的', JSON.stringify(bodies('t2')));
+  check('editing refused: and the user is told', errors.length === 1 && errors[0].includes('改不了'), JSON.stringify(errors));
+  source.refuse = false;
+  await refreshed();
+
+  // ---- deleting ----
+  const asked = [];
+  let answer = false;
+  comments.confirmDelete = async (question, detail) => { asked.push({ question, detail }); return answer; };
+  target = myReply();
+  await comments.delete(target);
+  check('deleting: it asks first, as it cannot be undone', asked.length === 1 && asked[0].question.includes('回复'), JSON.stringify(asked));
+  check('deleting: saying no changes nothing', bodies('t2').length === 2 && source.deletedMessages.length === 0);
+
+  answer = true;
+  clearErrors();
+  source.refuse = true;
+  await comments.delete(target);
+  check('deleting refused: at first it is gone', bodies('t2').length === 1);
+  await comments.whenSent();
+  check('deleting refused: then it is back in its place', bodies('t2').join() === 'two, changed by Bob,改过的', JSON.stringify(bodies('t2')));
+  check('deleting refused: and the user is told', errors.length === 1 && errors[0].includes('403'), JSON.stringify(errors));
+  source.refuse = false;
+  await refreshed();
+
+  target = myReply();
+  hold();
+  await comments.delete(target);
+  check('deleting a reply: it is gone at once, while the server has not answered', bodies('t2').length === 1 && source.deletedMessages.length === 0, JSON.stringify(bodies('t2')));
+  release();
+  await comments.whenSent();
+  check('deleting a reply: then Overleaf is told which', source.deletedMessages.length === 1 && source.deletedMessages[0].threadId === 't2' && source.deletedMessages[0].messageId === target.messageId, JSON.stringify(source.deletedMessages));
+  await refreshed();
+  check('deleting a reply: the comment stays', !!thread('t2') && bodies('t2').length === 1);
+
+  firstOfT('t1').messages.push(theirs('m9', 'a reply by Bob'));
+  await refreshed();
+  asked.length = 0;
+  target = thread('t1').comments[0];
+  hold();
+  await comments.delete(target);
+  check('deleting a comment: the question says its replies go too', asked[0].question.includes('批注') && asked[0].detail.includes('1 条回复'), JSON.stringify(asked));
+  check('deleting a comment: it is gone at once', !thread('t1') && source.deletedComments.length === 0);
+  check('deleting a comment: the plain file follows', await until(() => !listing().includes('a reply by Bob')), listing());
+  release();
+  await comments.whenSent();
+  check('deleting a comment: then Overleaf is told which, in which document', source.deletedComments.length === 1 && source.deletedComments[0].threadId === 't1' && source.deletedComments[0].docId === 'doc-of-main', JSON.stringify(source.deletedComments));
+  await refreshed();
+  check('deleting a comment: and it stays gone', !thread('t1'));
+
+  source.comments.push(comment('t8', 'tar', tarOffset, { messages: [mine('m8', 'deleted, or not')] }));
+  await refreshed();
+  clearErrors();
+  source.refuse = true;
+  await comments.delete(thread('t8').comments[0]);
+  check('deleting a comment refused: at first it is gone', !thread('t8'));
+  await comments.whenSent();
+  check('deleting a comment refused: then it is back', !!thread('t8') && errors.length === 1, JSON.stringify(errors));
+  source.refuse = false;
+
+  // ---- adding, the way VS Code offers it: an empty thread on a place, with a box ----
   const provider = comments.controller.commentingRangeProvider;
   const token = new vscode.CancellationTokenSource().token;
   const opened = await vscode.workspace.openTextDocument(main);
@@ -863,54 +1078,104 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   const documentShows = (text) => until(async () => (await vscode.workspace.openTextDocument(main)).getText().replace(/\r\n/g, '\n') === text);
   const newThread = (...range) => comments.controller.createCommentThread(vscode.Uri.file(main), new vscode.Range(...range), []);
   const lastAdded = () => source.added[source.added.length - 1];
+  const threadIdOf = (box) => [...comments.shown].find(([, entry]) => entry.thread === box)?.[0];
   put(main, 'first line\r\nb 疫苗 tar here\r\n\r\nlast\r\n');
   await documentShows('first line\nb 疫苗 tar here\n\nlast\n');
 
   const sentBefore = localChangesSent;
   let box = newThread(1, 2, 1, 4);
-  source.comments = [comment('new-thread', '疫苗', 'first line\nb '.length)];
+  hold();
   await comments.submit({ thread: box, text: ' 看这里 ' });
-  check('adding: the selected text, counted without CRLF, and the words', lastAdded()?.file === 'main.tex' && lastAdded()?.quote === '疫苗' && lastAdded()?.offset === 'first line\nb '.length && lastAdded()?.text === '看这里', JSON.stringify(lastAdded()));
-  check('adding: local changes go first, as the place is on the server\'s text', localChangesSent === sentBefore + 1);
-  check('adding: the box becomes the comment', thread('new-thread') === box && box.comments.length === 1 && box.comments[0].body === '这里要改');
-  check('adding: and sits on the text', rangeIs('new-thread', 1, 2, 1, 4), shownRange('new-thread'));
-  check('adding: it has the same label as any other', box.label === 'Overleaf 批注', box.label);
+  check('adding: the button returns while the server has not answered, so the box clears at once', source.added.length === 0);
+  check('adding: the box becomes the comment at once', threadIdOf(box) !== undefined && box.comments.length === 1 && box.comments[0].body === '看这里', JSON.stringify(box.comments));
+  check('adding: under the user\'s own name and the same label as any other', box.comments[0].author.name === '我自己' && box.label === 'Overleaf 批注', box.label);
+  const addedId = threadIdOf(box);
+  check('adding: its id has the form Overleaf uses', /^[0-9a-f]{24}$/.test(addedId), addedId);
+  check('adding: the plain file follows', await until(() => listing().includes('看这里')), listing());
+  release();
+  await comments.whenSent();
+  check('adding: the selected text, counted without CRLF, and the words', lastAdded()?.threadId === addedId && lastAdded()?.file === 'main.tex' && lastAdded()?.quote === '疫苗' && lastAdded()?.offset === 'first line\nb '.length && lastAdded()?.text === '看这里', JSON.stringify(lastAdded()));
+  check('adding: local changes go first, as the place is on the server\'s text', localChangesSent === sentBefore + 1 && source.sentOrder.indexOf('add') >= 0);
+  check('adding: and when it is listed it is the same box', await until(() => box.comments[0]?.contextValue === 'mine'), String(box.comments[0]?.contextValue));
+  check('adding: it sits on the text', rangeIs(addedId, 1, 2, 1, 4), shownRange(addedId));
+
+  // Overleaf is slow to list what it has accepted
+  source.listNewComments = false;
+  box = newThread(0, 0, 0, 5);
+  await comments.submit({ thread: box, text: 'not listed yet' });
+  await comments.whenSent();
+  const unlistedId = threadIdOf(box);
+  await refreshed();
+  check('adding: a comment Overleaf does not list yet stays', thread(unlistedId) === box && box.comments[0].body === 'not listed yet');
+  check('adding: and Overleaf is asked again', await until(() => source.reads > reads + 2, 5000));
+  comments.comments.find((c) => c.threadId === unlistedId).keepUntil = 0;
+  await refreshed();
+  check('adding: but not for ever', !thread(unlistedId));
+  source.listNewComments = true;
+  box.dispose();
+
+  // quick changes reach Overleaf in order, and later ones know what the earlier ones found out
+  source.sentOrder.length = 0;
+  source.changes.length = 0;
+  box = newThread(0, 0, 0, 5);
+  hold();
+  await comments.submit({ thread: box, text: 'quick' });
+  await comments.submit({ thread: box, text: 'quick reply' });
+  comments.resolve(box);
+  check('in order: all of it shows at once', !thread(threadIdOf(box) ?? 'none'));
+  release();
+  await comments.whenSent();
+  check('in order: it reaches Overleaf in order', source.sentOrder.join() === 'add,reply,resolve', source.sentOrder.join());
+  check('in order: resolving knows the document the comment was added to', source.changes[0].docId === 'doc-of-main', JSON.stringify(source.changes));
+  box.dispose();
 
   box = newThread(0, 6, 1, 1);
   await comments.submit({ thread: box, text: 'two lines' });
+  await comments.whenSent();
   check('adding: a selection over lines keeps LF', lastAdded().quote === 'line\nb' && lastAdded().offset === 6, JSON.stringify(lastAdded()));
   box.dispose();
 
   box = newThread(1, 0, 1, 0);
   await comments.submit({ thread: box, text: 'whole line' });
+  await comments.whenSent();
   check('adding: a click in the margin comments on the line', lastAdded().quote === 'b 疫苗 tar here' && lastAdded().offset === 'first line\n'.length, JSON.stringify(lastAdded()));
   box.dispose();
 
-  errors.length = 0;
+  clearErrors();
   let addedBefore = source.added.length;
   box = newThread(2, 0, 2, 0);
   await comments.submit({ thread: box, text: 'empty line' });
+  await comments.whenSent();
   check('adding: an empty line has nothing to comment on', source.added.length === addedBefore && errors.length === 1 && errors[0].includes('没有文字'), JSON.stringify(errors));
   check('adding: and the box stays', box.comments.length === 0);
   box.dispose();
 
-  errors.length = 0;
+  clearErrors();
   source.refuse = true;
   box = newThread(3, 0, 3, 4);
-  await comments.submit({ thread: box, text: 'refused' });
+  await comments.submit({ thread: box, text: '加不上' });
+  check('adding refused: at first it shows', box.comments.length === 1);
+  await comments.whenSent();
+  check('adding refused: then the box is empty again', box.comments.length === 0 && threadIdOf(box) === undefined);
+  check('adding refused: and what was written is in the message', errors.length === 1 && errors[0].includes('加不上') && errors[0].includes('403'), JSON.stringify(errors));
   source.refuse = false;
-  check('adding: a refusal is explained', errors.length === 1 && errors[0].includes('403'), JSON.stringify(errors));
+  retries[0]();
+  check('adding refused: trying again puts it back at once', box.comments.length === 1 && box.comments[0].body === '加不上');
+  await comments.whenSent();
+  check('adding refused: and goes through', lastAdded().text === '加不上');
+  await refreshed();
   box.dispose();
 
   addedBefore = source.added.length;
   box = newThread(3, 0, 3, 4);
   await comments.submit({ thread: box, text: '   ' });
+  await comments.whenSent();
   check('adding: nothing written, nothing sent', source.added.length === addedBefore);
   box.dispose();
 
   source.comments = [comment('t3', '', 0, { path: 'sections/later.tex' })];
-  emitter.fire();
-  await until(() => !!thread('t3') && !thread('new-thread'));
+  await refreshed();
+  await until(() => !!thread('t3'));
 
   // no connection
   source.failing = true;

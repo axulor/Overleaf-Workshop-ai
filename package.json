@@ -2,7 +2,7 @@
   "name": "overleaf-workshop-ai",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "icon": "resources/icons/app_icon.png",
   "license": "AGPL-3.0-only",
   "author": {
@@ -311,6 +311,28 @@
       {
         "command": "overleaf-workshop.sync.addCommentOnSelection",
         "title": "添加 Overleaf 批注",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.editComment",
+        "title": "编辑",
+        "icon": "$(edit)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.deleteComment",
+        "title": "删除",
+        "icon": "$(trash)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.saveEditedComment",
+        "title": "保存",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.cancelEditingComment",
+        "title": "取消",
         "category": "%extension.displayName%"
       },
       {
@@ -638,6 +660,46 @@
         {
           "command": "overleaf-workshop.sync.addCommentOnSelection",
           "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.sync.editComment",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.sync.deleteComment",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.sync.saveEditedComment",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.sync.cancelEditingComment",
+          "when": "false"
+        }
+      ],
+      "comments/comment/title": [
+        {
+          "command": "overleaf-workshop.sync.editComment",
+          "group": "inline@1",
+          "when": "commentController == overleaf-workshop-ai.comments && comment == mine"
+        },
+        {
+          "command": "overleaf-workshop.sync.deleteComment",
+          "group": "inline@2",
+          "when": "commentController == overleaf-workshop-ai.comments && comment == mine"
+        }
+      ],
+      "comments/comment/context": [
+        {
+          "command": "overleaf-workshop.sync.saveEditedComment",
+          "group": "inline@1",
+          "when": "commentController == overleaf-workshop-ai.comments"
+        },
+        {
+          "command": "overleaf-workshop.sync.cancelEditingComment",
+          "group": "inline@2",
+          "when": "commentController == overleaf-workshop-ai.comments"
         }
       ],
       "comments/commentThread/context": [

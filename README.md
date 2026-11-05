@@ -31,6 +31,9 @@ Comments made on Overleaf show on the commented text and in VS Code's Comments p
 - To add a comment, select text and choose `添加 Overleaf 批注` from the right-click menu, or click the `+` beside a line to comment on that line.
 - To reply, open a comment and write in the box under it.
 - The ✓ on a comment resolves it, and the button at the top of the Comments panel reopens a resolved one.
+- The pencil and the bin on your own comments and replies edit and delete them. Deleting a comment deletes its replies too.
+
+Whatever you do shows at once and is sent in the background. If Overleaf refuses it, it is taken back and you can try again.
 
 They are also kept in `.output/comments.md` in the project folder, with the file, line, commented text, author and words of each comment, so any tool can read them. This file is rewritten when comments change, and the `.output` folder is kept out of git.
 

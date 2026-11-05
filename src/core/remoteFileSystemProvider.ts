@@ -1514,6 +1514,30 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    async editCommentMessage(threadId:string, messageId:string, content:string) {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.editCommentMessage(identity, this.projectId, threadId, messageId, content);
+        if (res.type!=='success') {
+            throw new Error(res.message ?? 'Overleaf did not accept the change');
+        }
+    }
+
+    async deleteCommentMessage(threadId:string, messageId:string) {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.deleteCommentMessage(identity, this.projectId, threadId, messageId);
+        if (res.type!=='success') {
+            throw new Error(res.message ?? 'Overleaf did not accept the change');
+        }
+    }
+
+    async deleteCommentThread(docId:string, threadId:string) {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.deleteCommentThread(identity, this.projectId, docId, threadId);
+        if (res.type!=='success') {
+            throw new Error(res.message ?? 'Overleaf did not accept the change');
+        }
+    }
+
     async setCommentResolved(docId:string, threadId:string, resolved:boolean) {
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
         const res = await this.api.setCommentThreadResolved(identity, this.projectId, docId, threadId, resolved);

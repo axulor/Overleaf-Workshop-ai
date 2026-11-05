@@ -969,6 +969,22 @@ export class BaseAPI {
         return this.request('POST', `project/${projectId}/thread/${threadId}/messages`, {content}, undefined, {'X-Csrf-Token': identity.csrfToken});
     }
 
+    async editCommentMessage(identity:Identity, projectId:string, threadId:string, messageId:string, content:string) {
+        this.setIdentity(identity);
+        return this.request('POST', `project/${projectId}/thread/${threadId}/messages/${messageId}/edit`, {content}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async deleteCommentMessage(identity:Identity, projectId:string, threadId:string, messageId:string) {
+        this.setIdentity(identity);
+        return this.request('DELETE', `project/${projectId}/thread/${threadId}/messages/${messageId}`);
+    }
+
+    /** A whole comment: what was said in it, and its place in the document. */
+    async deleteCommentThread(identity:Identity, projectId:string, docId:string, threadId:string) {
+        this.setIdentity(identity);
+        return this.request('DELETE', `project/${projectId}/doc/${docId}/thread/${threadId}`);
+    }
+
     async setCommentThreadResolved(identity:Identity, projectId:string, docId:string, threadId:string, resolved:boolean) {
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/doc/${docId}/thread/${threadId}/${resolved ? 'resolve' : 'reopen'}`, {}, undefined, {'X-Csrf-Token': identity.csrfToken});

@@ -1,4 +1,3 @@
-import { randomBytes } from 'crypto';
 import * as vscode from 'vscode';
 import { OUTPUT_FOLDER_NAME } from '../consts';
 import { FileRefEntity, RemoteFileSystemProvider, VirtualFileSystem } from '../core/remoteFileSystemProvider';
@@ -106,20 +105,38 @@ export class VfsRemoteSide implements RemoteSide, CommentSource, vscode.Disposab
         await this.vfs.setCommentResolved(comment.docId, comment.threadId, resolved);
     }
 
-    async addComment(path: string, quote: string, offset: number, text: string) {
-        const { fileType } = await this.vfs._resolveUri(this.uri(path));
-        if (fileType !== 'doc') { throw new Error(`${path} 不是 Overleaf 上的文档`); }
+    async addComment(threadId: string, path: string, quote: string, offset: number, text: string) {
+        const { fileType, fileEntity } = await this.vfs._resolveUri(this.uri(path));
+        if (fileType !== 'doc' || !fileEntity) { throw new Error(`${path} 不是 Overleaf 上的文档`); }
         const at = locateQuote(await this.readDoc(path), quote, offset);
         if (at === undefined) { throw new Error('这段文字还没有同步到 Overleaf，请稍后再试'); }
         // In the order of Overleaf's own page, so that a comment never shows with nothing said in it.
-        const threadId = Math.floor(Date.now() / 1000).toString(16).padStart(8, '0') + randomBytes(8).toString('hex');
         await this.vfs.addCommentMessage(threadId, text);
         await this.vfs.addCommentRange(this.uri(path), threadId, quote, at);
-        return threadId;
+        return fileEntity._id;
     }
 
     async addReply(comment: OnlineComment, text: string) {
         await this.vfs.addCommentMessage(comment.threadId, text);
+    }
+
+    async editMessage(comment: OnlineComment, messageId: string, text: string) {
+        await this.vfs.editCommentMessage(comment.threadId, messageId, text);
+    }
+
+    async deleteMessage(comment: OnlineComment, messageId: string) {
+        await this.vfs.deleteCommentMessage(comment.threadId, messageId);
+    }
+
+    async deleteComment(comment: OnlineComment) {
+        await this.vfs.deleteCommentThread(comment.docId, comment.threadId);
+    }
+
+    async currentUser() {
+        const project = await this.vfs.init();
+        const id = this.vfs._userId;
+        const user = [project.owner, ...project.members].find((member) => member?._id === id);
+        return {id, name: [user?.first_name, user?.last_name].filter(Boolean).join(' ') || user?.email || '我'};
     }
 
     private async ensureFolder(path: string) {
