@@ -156,6 +156,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     /** Whether event handlers have been registered on the current socket */
     private handlersRegistered: boolean = false;
     private updateQueue?: Promise<unknown>;
+    private gaveUpRetrying: boolean = false;
     private outputBuildId?: string;
     private compileGroup?: string;
     private clsiServerId?: string;
@@ -221,6 +222,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         // if retry connection exhausted, show error
         if (this.retryConnection >= MAX_RETRIES) {
+            this.gaveUpRetrying = true;
             this.retryConnection = 0;
             this.initializing = undefined;
             this.reconnectingNotification = false;
@@ -233,6 +235,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                     vscode.commands.executeCommand("workbench.action.reloadWindow");
                 } else if (choice === vscode.l10n.t('Retry')) {
                     this.retryConnection = 0;
+                    this.gaveUpRetrying = false;
                     this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
                     this.initializing = this.initializingPromise;
                     this.init().catch(() => {});
@@ -400,6 +403,11 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (root._id === entityId) {
             return {parentFolder: root, fileType: 'folder', fileEntity: root, path};
         } else {
+            // A folder's parent is needed to remove or move it, which only the parent's search can give.
+            const folder = root.folders.find((each) => each._id === entityId);
+            if (folder) {
+                return {parentFolder: root, fileType: 'folder', fileEntity: folder, path: path+folder.name+'/'};
+            }
             // search files in root
             for (const _type of Object.keys(FolderKeys)) {
                 const key = FolderKeys[_type];
@@ -499,11 +507,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.retryConnection = 0;
                 this.reconnectingNotification = false;
                 this.lastDisconnectTime = 0;
-                if (this.retryTimer) {
-                    clearTimeout(this.retryTimer);
-                    this.retryTimer = undefined;
-                }
                 this.publicId = publicId;
+                // A pending rejoin must still happen: the new connection has joined no document, so without it
+                // no edits arrive. If retrying had stopped, the connection coming back starts it again.
+                if (this.gaveUpRetrying) {
+                    this.gaveUpRetrying = false;
+                    this.initializing = this.initializingPromise;
+                }
             },
             onFileCreated: (parentFolderId:string, type:FileType, entity:FileEntity) => {
                 const res = this._resolveById(parentFolderId);
@@ -543,6 +553,8 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const newPath = this._resolveById(folderId);
                 if (oldPath && newPath) {
                     const newParentFolder = newPath.fileEntity as FolderEntity;
+                    // Already there, as a move made from here is applied before the server announces it.
+                    if (oldPath.parentFolder===newParentFolder) { return; }
                     this.insertEntity(newParentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.notify([
@@ -706,31 +718,24 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
-        const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
+        const {parentFolder, fileName, fileType, fileEntity} = await this._resolveUri(uri);
         if (fileEntity && !overwrite) {
             throw vscode.FileSystemError.FileExists(uri);
         }
 
-        let res = undefined;
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-
-        if (content.length===0) {
-            const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
-            if (_res.type==='success') {
-                res = _res.entity;
-            }
-        } else {
-            const parentFolderId = parentFolder._id;
-            const _res = await this.api.uploadFile(identity, this.projectId, parentFolderId, fileName, content);
-            if (_res.type==='success' && _res.entity!==undefined) {
-                res = _res.entity;
-            } else {
-                if (_res.message!==undefined) {
-                    vscode.window.showErrorMessage(_res.message);
-                }
-            }
+        const _res = content.length===0
+            ? await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName)
+            : await this.api.uploadFile(identity, this.projectId, parentFolder._id, fileName, content);
+        const res = _res.type==='success' ? _res.entity : undefined;
+        if (!res?._id) {
+            throw new Error(_res.message ?? `Overleaf did not accept ${fileName}`);
         }
-        if (res && res._type) {
+        if (res._type) {
+            // Replacing a file gives it a new id, and the old one must not stay listed under the same name.
+            if (fileEntity && fileType && fileEntity._id!==res._id) {
+                this.removeEntity(parentFolder, fileType, fileEntity);
+            }
             this.insertEntity(parentFolder, res._type, res);
             this.notify([
                 {type: vscode.FileChangeType.Created, uri: uri},
@@ -947,8 +952,8 @@ export class VirtualFileSystem extends vscode.Disposable {
      * Unlike writeFile it does not merge anything itself: a folder sync has already worked out
      * the content, and merging again could apply someone else's change a second time.
      */
-    async replaceDocContent(uri: vscode.Uri, text: string) {
-        return this.inTurn(() => this.replaceDocContentNow(uri, text));
+    async replaceDocContent(uri: vscode.Uri, text: string, basedOn?: string) {
+        return this.inTurn(() => this.replaceDocContentNow(uri, text, basedOn));
     }
 
     /** Marks where a comment is, once what was said in it is on the server. The text must be what the server has at that offset. */
@@ -1008,7 +1013,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         doc.lastVersion = doc.version;
     }
 
-    private async replaceDocContentNow(uri: vscode.Uri, text: string) {
+    /** Returns false, sending nothing, if the document no longer holds the text the change was based on. */
+    private async replaceDocContentNow(uri: vscode.Uri, text: string, basedOn?: string) {
         const {fileType, fileEntity} = await this._resolveUri(uri);
         if (fileType!=='doc' || !fileEntity) {
             throw vscode.FileSystemError.FileNotFound(uri);
@@ -1018,7 +1024,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             await this.openFile(uri);
         }
         const current = doc.remoteCache!;
-        if (current===text) { return; } // the server drops the connection over an empty update
+        // Someone's edit arrived after the caller read the text. The difference from now on would remove it.
+        if (basedOn!==undefined && current!==basedOn) { return false; }
+        if (current===text) { return true; } // the server drops the connection over an empty update
 
         // Each operation applies to the result of the one before it, so a deletion does not move the position.
         const op: NonNullable<UpdateSchema['op']> = [];
@@ -1056,6 +1064,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             doc.remoteCache = text;
             doc.localCache = text;
         }
+        return true;
     }
 
     async mkdir(uri: vscode.Uri) {

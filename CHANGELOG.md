@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Overleaf Workshop AI
+
+This fork has its own version numbers, starting from Overleaf Workshop 0.15.10. Entries below this section are from the original project.
+
+### [0.6.0] - 2026-11-05
+Fixes from a review for data loss, ahead of the first use on a real paper, each checked against real Overleaf.
+- A collaborator's edit that arrives during a merge or a push is no longer removed: writes state the text they were based on.
+- Typing at the moment an edit arrives is no longer lost, and a file open in the editor is updated through the editor.
+- A tool writing a file from an old copy no longer removes the edits that arrived since: the file is held, and the user chooses.
+- Moving a file no longer makes it vanish locally, and a file with Windows line endings no longer gains blank lines when it is open.
+- Uploading works. Before this, new files could not be uploaded, and a replaced file showed as sent although Overleaf kept the old one.
+- After a dropped connection the project is joined again. Before this, edits stopped arriving while the status said synced.
+- A character Overleaf cannot hold, or a file that is not UTF-8, is refused with a message. Sending such a character made the server drop the whole edit.
+- Choosing a side in a conflict decides only the overlapping places, and keeps a copy of the local version.
+- A local rename keeps the document and its comments.
+- Deleting or moving a folder online is followed.
+- `ignore-patterns` can no longer bring the extension's own folders into the project.
+- Warnings for opening the synced folder itself, and for several synced folders in one place.
+- Resolving a comment asks first.
+- Rewrote the README for this fork.
+
+### [0.5.0] - 2026-11-05
+- Comment actions show at once and are sent in the background. If Overleaf refuses, they are taken back, with a way to try again.
+- Edit and delete your own comments and replies.
+
+### [0.4.0] - 2026-11-05
+- Add comments and reply to them in VS Code.
+
+### [0.3.0] - 2026-11-05
+- Resolve and reopen comments in VS Code.
+- The original ways of opening a project are hidden behind a setting.
+- The compile button has its own icon.
+
+### [0.2.0] - 2026-11-05
+- Comments show in VS Code and are kept in `.output/comments.md`.
+- Received edits are applied correctly when they delete non-ASCII text, each update is handled once, and a write waits for the server to apply it.
+
+### [0.1.1] - 2026-11-05
+- Removed the MCP server, the `/sync` command and the translation tools, to focus on syncing.
+- Works next to LaTeX Workshop without failing local builds or losing the compile shortcuts.
+
+### [0.1.0] - 2026-11-05
+- Sync a project with a real local folder, in both directions and in real time.
+- Compile results report what really happened, and are saved to `.output/`.
+
 ## [0.15.10] - 2026-07-11
 ### Changed
 - fix: enhance connection resilience and fix TCP RST causing spurious connection lost (fixes #309)

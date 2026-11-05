@@ -1,5 +1,4 @@
 /* eslint-disable @typescript-eslint/naming-convention */
-import * as stream from 'stream';
 import * as FormData from 'form-data';
 import { v4 as uuidv4 } from 'uuid';
 import { fetch } from 'undici';
@@ -417,8 +416,9 @@ export class BaseAPI {
                         });
                         break;
                     case 'POST':
-                        const content_type = body instanceof FormData ? undefined : {'Content-Type': 'application/json'};
-                        const raw_body = body instanceof FormData ? body : JSON.stringify({
+                        // fetch does not understand the form-data package's object, and would send it as text.
+                        const content_type = body instanceof FormData ? body.getHeaders() : {'Content-Type': 'application/json'};
+                        const raw_body = body instanceof FormData ? body.getBuffer() : JSON.stringify({
                             _csrf: this.identity!.csrfToken,
                             ...body
                         });
@@ -619,13 +619,12 @@ export class BaseAPI {
     }
 
     async uploadFile(identity:Identity, projectId:string, parentFolderId:string, filename:string, fileContent:Uint8Array) {
-        const fileStream = stream.Readable.from(fileContent);
         const formData = new FormData();
         const mimeType = require('mime-types').lookup(filename);
         formData.append('targetFolderId', parentFolderId);
         formData.append('name', filename);
         formData.append('type', mimeType? mimeType : 'text/plain');
-        formData.append('qqfile', fileStream, {filename});
+        formData.append('qqfile', Buffer.from(fileContent), {filename});
 
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/upload?folder_id=${parentFolderId}`, formData, (res) => {
@@ -637,9 +636,8 @@ export class BaseAPI {
 
     async uploadProject(identity:Identity, filename:string, fileContent:Uint8Array) {
         const uuid = uuidv4();
-        const fileStream = stream.Readable.from(fileContent);
         const formData = new FormData();
-        formData.append('qqfile', fileStream, {filename});
+        formData.append('qqfile', Buffer.from(fileContent), {filename});
 
         this.setIdentity(identity);
         return this.request('POST', `project/new/upload?_csrf=${identity.csrfToken}&qquuid=${uuid}&qqfilename=${filename}&qqtotalfilesize=${fileContent.length}`, formData, (res) => {

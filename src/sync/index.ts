@@ -4,7 +4,7 @@ import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { CompileOutcome, RemoteFileSystemProvider, VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { ProjectComments } from './comments';
-import { ConflictReason, DEFAULT_IGNORE_PATTERNS, FolderSync, SyncStatus } from './folderSync';
+import { ConflictReason, DEFAULT_IGNORE_PATTERNS, FolderSync, SyncProblem, SyncStatus } from './folderSync';
 import { VfsRemoteSide } from './vfsRemoteSide';
 
 const CONFLICT_REASONS: {[reason in ConflictReason]: string} = {
@@ -12,6 +12,7 @@ const CONFLICT_REASONS: {[reason in ConflictReason]: string} = {
     bothNew: '本地和线上都有这个文件，内容不同',
     deletedOnOneSide: '一边修改了这个文件，另一边删除了它',
     emptied: '文件内容被清空了',
+    olderCopy: '这个文件缺少线上刚到的修改，可能是工具根据旧副本写入的',
     notMergeable: '本地和线上都改了这个非文本文件',
 };
 
@@ -53,11 +54,47 @@ export class FolderSyncManager {
     /** Starts syncing if the open folder already has a linked project. */
     async resume() {
         const root = this.workspaceFolder();
-        const folder = root && await LocalReplicaSCMProvider.findProjectFolder(root);
+        if (!root) { return; }
+        if (await this.isSyncedFolder(root)) {
+            this.warnAboutOpeningFromInside(root);
+            return;
+        }
+        const folder = await LocalReplicaSCMProvider.findProjectFolder(root);
         if (!folder) { return; }
         const settings = await this.readJson(this.settingsUri(folder));
         if (settings?.uri) {
-            await this.start(folder, vscode.Uri.parse(settings.uri), settings['ignore-patterns']);
+            this.warnAboutOtherLinks(root, folder);
+            await this.start(folder, vscode.Uri.parse(settings.uri));
+        }
+    }
+
+    /** Whether this engine has synced this folder itself, rather than a folder inside it. */
+    private async isSyncedFolder(folder: vscode.Uri) {
+        try {
+            await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder, '.overleaf', 'sync', 'manifest.json'));
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /** Opened from inside, nothing would sync, though the panel and compiling still seem to work. */
+    private async warnAboutOpeningFromInside(folder: vscode.Uri) {
+        const open = '打开上一级文件夹';
+        const answer = await vscode.window.showWarningMessage('这个文件夹本身是同步文件夹，这样打开不会同步。请打开它的上一级文件夹。', open);
+        if (answer === open) { await this.openFolder(vscode.Uri.joinPath(folder, '..')); }
+    }
+
+    private async warnAboutOtherLinks(root: vscode.Uri, used: vscode.Uri) {
+        const others: string[] = [];
+        for (const [name, type] of await vscode.workspace.fs.readDirectory(root)) {
+            const each = vscode.Uri.joinPath(root, name);
+            if (type & vscode.FileType.Directory && each.path !== used.path && (await this.readJson(this.settingsUri(each)))?.uri) {
+                others.push(name);
+            }
+        }
+        if (others.length > 0) {
+            vscode.window.showWarningMessage(`这里有多个同步文件夹，只有“${used.path.slice(used.path.lastIndexOf('/') + 1)}”在同步。这些不会同步：${others.join('、')}。`);
         }
     }
 
@@ -73,6 +110,10 @@ export class FolderSyncManager {
     private async linkProject(item: {uri: string, label: string}) {
         // A window showing an online project or no folder has nowhere to sync to, so one is chosen and opened.
         const current = this.workspaceFolder();
+        if (current && await this.isSyncedFolder(current)) {
+            this.warnAboutOpeningFromInside(current);
+            return;
+        }
         const parent = current ?? await this.pickParentFolder(item.label);
         if (!parent) { return; }
 
@@ -123,7 +164,7 @@ export class FolderSyncManager {
         }
         const answer = await vscode.window.showInformationMessage(
             `同步“${projectName}”到本地？`,
-            {modal: true, detail: `位置：${folder.fsPath}\n之后本地和线上的修改会自动互相同步。${hasFiles ? '\n文件夹里已有的文件不会被覆盖。' : ''}`},
+            {modal: true, detail: `位置：${folder.fsPath}\n之后本地和线上的修改会自动互相同步。${hasFiles ? '\n文件夹里已有的文件不会被覆盖，但线上没有的文件会上传到 Overleaf。' : ''}`},
             '开始同步',
         );
         return answer === '开始同步';
@@ -164,7 +205,7 @@ export class FolderSyncManager {
         }
     }
 
-    private async start(folder: vscode.Uri, projectUri: vscode.Uri, ignorePatterns?: string[]) {
+    private async start(folder: vscode.Uri, projectUri: vscode.Uri) {
         await this.leaveCompilingToOverleaf();
         const previous = this.sync;
         this.stop();
@@ -179,8 +220,9 @@ export class FolderSyncManager {
             this.sync = new FolderSync(folder, this.remote, {
                 confirmRemoteDelete: (paths) => this.confirmRemoteDelete(paths),
                 onConflict: (path, reason) => this.showConflict(path, reason),
+                onProblem: (path, problem) => this.showProblem(path, problem),
                 log: (message) => this.log.info(message),
-                ignorePatterns: ignorePatterns ?? DEFAULT_IGNORE_PATTERNS,
+                ignorePatterns: (await this.readJson(this.settingsUri(folder)))?.['ignore-patterns'] ?? DEFAULT_IGNORE_PATTERNS,
             });
             this.sync.onDidChangeStatus((status) => this.renderStatus(status));
             this.renderStatus(this.sync.status);
@@ -190,8 +232,14 @@ export class FolderSyncManager {
             CompileManager.beforeCompile = async () => {
                 await this.sync?.flush();
                 const failed = this.sync?.status.failed ?? [];
-                if (failed.length > 0) {
-                    throw new Error(`${failed.join('、')} 还没有同步到 Overleaf，编译结果不会包含最新的修改`);
+                const refused = this.sync?.status.refused ?? [];
+                const passing = failed.filter((path) => !refused.includes(path));
+                if (passing.length > 0) {
+                    throw new Error(`${passing.join('、')} 还没有同步到 Overleaf，编译结果不会包含最新的修改`);
+                }
+                // These wait for someone to change them, which is no reason to stop compiling everything else.
+                if (refused.length > 0) {
+                    vscode.window.showWarningMessage(`${refused.join('、')} 没有同步，这次编译不包含它们的最新修改。`);
                 }
             };
             CompileManager.afterCompile = (vfsAfter, outcome) => this.saveOutputs(folder, vfsAfter, outcome);
@@ -236,14 +284,22 @@ export class FolderSyncManager {
         const listed = paths.slice(0, 8).join('\n') + (paths.length > 8 ? `\n……共 ${paths.length} 个文件` : '');
         const answer = await vscode.window.showWarningMessage(
             `本地删除了 ${paths.length} 个文件，要同时从 Overleaf 删除吗？`,
-            {modal: true, detail: `${listed}\n\n如果取消，这些文件会从线上恢复到本地。`},
+            {modal: true, detail: `${listed}\n\n这些文档上的批注也会一起删除。如果取消，这些文件会从线上恢复到本地。`},
             '从 Overleaf 删除',
         );
         return answer === '从 Overleaf 删除';
     }
 
+    private showProblem(path: string, problem: SyncProblem) {
+        vscode.window.showWarningMessage(problem.kind === 'notUtf8'
+            ? `${path} 不是 UTF-8 编码。转换编码之前，这个文件不会同步。`
+            : `${path} 第 ${problem.line} 行的“${problem.character}”无法保存到 Overleaf。替换这个字符之前，这个文件不会同步。`);
+    }
+
     private async showConflict(path: string, reason: ConflictReason) {
-        const choice = await vscode.window.showWarningMessage(`${path}：${CONFLICT_REASONS[reason]}。在你选择之前，这个文件不会同步。`, COMPARE, KEEP_LOCAL, KEEP_ONLINE);
+        const scope = reason === 'sameRegion' ? '你的选择只决定冲突的地方，其他修改都会保留。'
+            : reason === 'olderCopy' ? '保留本地版本会覆盖线上这些修改。' : '';
+        const choice = await vscode.window.showWarningMessage(`${path}：${CONFLICT_REASONS[reason]}。在你选择之前，这个文件不会同步。${scope}`, COMPARE, KEEP_LOCAL, KEEP_ONLINE);
         await this.actOnConflict(path, choice);
     }
 

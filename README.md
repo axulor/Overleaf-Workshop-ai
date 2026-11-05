@@ -1,136 +1,137 @@
 # Overleaf Workshop AI
 
-An unofficial fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop) by iamhyc and contributors, under the same AGPL-3.0 license. It is not affiliated with Overleaf or with the original project, and it cannot run alongside the original extension: disable that one first.
+把 Overleaf 上的在线项目同步成一个真实的本地文件夹。在 VS Code 里改文件，就像在网页上改一样：修改实时到达合作者，编译在 Overleaf 上进行，批注也能在本地查看和处理。
 
-It keeps an Overleaf project in a real local folder, so that editing it with any tool feels like editing it online: changes reach collaborators in real time, and compiling happens on Overleaf.
+> **English:** A VS Code extension that keeps an Overleaf project in a real local folder, in both directions and in real time, so any tool can edit it. Compiling happens on Overleaf, and comments can be read and handled locally. It is an unofficial fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop). The interface is currently mostly in Chinese.
 
-### Syncing a project to a local folder
+这是 [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop)（iamhyc 及贡献者）的非官方分支，使用相同的 AGPL-3.0 许可，与 Overleaf 官方和原项目都没有关系。
 
-The original extension opens a project in a virtual folder, which tools that work on real files cannot reach. Here, the project lives in a real folder:
+它和原插件的主要区别：原插件打开的是虚拟文件夹，AI 助手等只能处理真实文件的工具进不去；这里的项目就是一个普通文件夹，任何工具改了文件，修改都会同步到 Overleaf。
 
 ```
-my-paper/                    open this folder in VS Code
-├─ overleaf-<project name>/  the Overleaf project, kept in step in both directions
-├─ zh/, data/, code/, ...    anything else stays local
+my-paper/                    在 VS Code 里打开这个文件夹
+├─ overleaf-<项目名>/         Overleaf 项目，和线上双向同步
+│  └─ .output/               编译生成的 PDF 和日志，以及批注
+├─ .vscode/settings.json     装了 LaTeX Workshop 时才会生成，见“编译”
+└─ zh/, data/, code/, ...    其他文件夹只留在本地，不会上传
 ```
 
-Open your paper's folder, hover over a project in the Overleaf panel and click the cloud icon (`同步到本地`). The original ways of opening a project are hidden, as tools cannot work in their virtual folders and the old local replica does not sync by itself. The setting `overleaf-workshop.projectManager.showOriginalOpenActions` brings them back.
+## 安装
 
-- Any change to a file reaches Overleaf about a second later, whichever tool made it. Typing in VS Code does too, without saving.
-- Changes are sent as real-time edits of the difference, not by replacing files, so collaborators' comments stay in place.
-- Online changes arrive in the folder as they happen, including into a file open with unsaved typing.
-- If both sides changed the same place, nothing is overwritten: both versions are kept and you choose one. Different sentences of one paragraph merge by themselves.
-- Files deleted locally are only deleted online after you confirm. Files deleted online are moved to `.overleaf/sync/trash/` in the project folder.
-- Compile results are copied to `.output/` in the project folder. A compile first sends all pending changes.
-- Changes made while VS Code is closed or offline are merged when it reconnects.
+需要 VS Code 1.80 或更高版本。目前没有上架扩展市场，需要自己打包：
 
-### Comments
+```
+git clone https://github.com/axulor/Overleaf-Workshop-ai.git
+cd Overleaf-Workshop-ai
+npm install
+cd views/chat-view && npm install && cd ../..
+npx @vscode/vsce package --out overleaf-workshop-ai.vsix
+code --install-extension overleaf-workshop-ai.vsix
+```
 
-Comments made on Overleaf show on the commented text and in VS Code's Comments panel, and follow the text as it changes. You can also work with them here, and collaborators see it as it happens:
+它和原插件不能同时运行，请先在扩展面板里**禁用原来的 Overleaf Workshop**。
 
-- To add a comment, select text and choose `添加 Overleaf 批注` from the right-click menu, or click the `+` beside a line to comment on that line.
-- To reply, open a comment and write in the box under it.
-- The ✓ on a comment resolves it, and the button at the top of the Comments panel reopens a resolved one.
-- The pencil and the bin on your own comments and replies edit and delete them. Deleting a comment deletes its replies too.
+## 开始使用
 
-Whatever you do shows at once and is sent in the background. If Overleaf refuses it, it is taken back and you can try again.
+1. **登录。** 打开侧边栏的 Overleaf 面板，添加服务器 `https://www.overleaf.com`，选择 Login with Cookies，粘贴 Cookie（获取方法见下）。
+2. **打开论文文件夹。** 在 VS Code 里打开你存放这篇论文的本地文件夹，也就是 `overleaf-<项目名>/` 的上一级。直接打开 `overleaf-<项目名>/` 不会同步，插件会提示你。
+3. **同步。** 把鼠标移到面板里的项目上，点云朵图标（`同步到本地`），确认后会生成 `overleaf-<项目名>/`。状态栏显示 `Overleaf：已同步` 就可以开始了。
 
-They are also kept in `.output/comments.md` in the project folder, with the file, line, commented text, author and words of each comment, so any tool can read them. This file is rewritten when comments change, and the `.output` folder is kept out of git.
+之后再打开这个文件夹时，会自动恢复同步。
 
-### Compiling
+**获取 Cookie：** 在已登录 Overleaf 的浏览器里按 <kbd>F12</kbd> 打开开发者工具，切到“网络”标签，打开 Overleaf 主页，筛选 `/project` 并选中完全匹配的那一项，复制请求头里 `Cookie` 的值。它的格式类似 `overleaf_session2=...`。Cookie 相当于你的登录凭据，不要发给别人。
 
-- A PDF with LaTeX errors in its log no longer shows as a failed compile. As on Overleaf's own page, the PDF is available and the errors are listed in the Problems panel.
-- A manual compile opens the PDF beside the editor.
-- A failed compile says why, keeps its log, and each compile is recorded in the `Overleaf Workshop AI` output channel.
-- The build cache is no longer cleared automatically. The option to recompile from scratch is in the compile settings menu.
-- A manual compile is no longer sent to Overleaf as an auto-compile.
-- An error during a compile no longer blocks later compiles until the window is reloaded.
-- A project with no main document set uses `main.tex` or its only `.tex` file, and asks if neither applies.
-- Next to LaTeX Workshop, a synced workspace turns off its automatic local builds and its compile shortcuts, in `.vscode/settings.json`, so `Ctrl+Alt+B` compiles on Overleaf and no local build fails on every change. A value already set in the workspace is left alone. LaTeX Workshop's own ▶ button stays and still builds locally; the button that compiles on Overleaf has a circle around its triangle.
+## 同步
 
-To run the tests, which use fake Overleaf responses and need no account: `powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1`. To try this build against a real account without touching your own VS Code: `test\dev-window.ps1`.
+- 任何工具对文件的修改，大约一秒后到达 Overleaf。在 VS Code 里打字也一样，不用保存。
+- 发送的是实时的差异编辑，不是整个替换文件，所以合作者的批注不会丢。
+- 线上的修改实时到达本地，包括你正开着、还没保存的文件。
+- 两边改了同一处时不会互相覆盖：由你选择保留哪一边，而且这个选择只决定冲突的地方，其他修改都会保留。选择线上版本时，本地版本的副本存在 `.overleaf/sync/conflicts/`。同一段的不同句子会自动合并。
+- 本地删除文件时，要你确认后才会删除线上的，文档上的批注也会一起删除。线上删除的文件，本地副本会移到 `.overleaf/sync/trash/`。
+- 本地重命名文件，或者把文件移到另一个文件夹（不改名），线上也会同样操作，批注会保留。同时改名和移动时，会变成上传新文件加删除旧文件，批注不会保留。
+- VS Code 关闭或断网期间的修改，重新连接后会自动合并。断线后会重新加入项目，状态栏在这期间显示离线。
+- 如果某个工具（不是在 VS Code 里打字）写入的文件缺少线上五分钟内到达的最后一次修改，它可能是根据旧副本写的，这时不会发送，而是提示你选择。这样合作者的文字不会被悄悄覆盖。工具有意删除别人刚写的内容时，也会这样问一次。如果工具只是恰好在修改到达的瞬间写入，两边的内容会自动合并，不会打扰你。
 
-The rest of this document is from the original project.
+状态栏的 `Overleaf：` 显示当前状态，有冲突时单击可以处理，显示“未同步”时单击可以查看原因。
 
----
+**有两种文件不会同步，插件会提示你，修改后就恢复同步：**
 
-Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
+- 含有 Overleaf 无法保存的字符，比如表情符号、部分数学字母（𝐱）和极少数生僻字（𠮷）。Overleaf 收到这种字符会断开连接并丢弃整次修改，所以插件不会发送，并提示字符和行号。
+- 不是 UTF-8 编码的文本文件。
 
-### User Guide
+以下文件不会同步，它们留在各自一边：隐藏文件（以 `.` 开头）、LaTeX 中间文件（`*.aux`、`*.log`、`*.bbl`、`*.out`、`*.toc` 等）、`main.pdf` 和 `output.pdf`。需要调整时，可以在 `overleaf-<项目名>/.overleaf/settings.json` 里设置 `ignore-patterns`，它会替换这个默认列表。`.overleaf`、`.output` 和 `.git` 文件夹始终不会同步。
 
-The full user guide is available at [GitHub Wiki](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki).
+## 编译
 
-### Features
+| 操作 | 快捷键 |
+|---|---|
+| 在 Overleaf 上编译（也可以点标题栏带圆圈的 ▶） | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> |
+| 查看 PDF | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> |
+| 从代码跳到 PDF（在 PDF 上双击可以跳回代码） | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd> |
 
-> [!NOTE]
-> For SSO login or captcha enabled servers like `https://www.overleaf.com`, please use "**Login with Cookies**" method.
-> For more details, please refer to [How to Login with Cookies](#how-to-login-with-cookies).
+- 编译前会先把本地修改全部发出去，手动编译后会在旁边打开 PDF。
+- PDF 和日志保存在 `overleaf-<项目名>/.output/`。
+- 和 Overleaf 网页一样，日志里有 LaTeX 错误但生成了 PDF 时，不算编译失败：状态栏显示警告，错误列在“问题”面板。
+- 编译失败时会说明原因（比如超时，免费版的时限约为 10 秒），每次编译都记录在 `Overleaf Workshop AI` 输出通道。
 
-- Login Server, Open Projects and Edit Files
+**和 LaTeX Workshop 一起用：** 同步下来的是真实的 `.tex` 文件，LaTeX Workshop 会把它们当成自己的，一改就在本地编译，没装 TeX 时会不断弹错。所以同步的工作区会在 `.vscode/settings.json` 里关掉它的自动编译和编译快捷键，已经设置过的值不会改动。它自己的绿色 ▶ 按钮还在，那个仍然是本地编译。
 
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo01-login.gif" height=400px/>
+## 批注
 
-- On-the-fly Compiling and Previewing
-  > <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> to compile, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> preview.
+Overleaf 上的批注会显示在对应的文字和 VS Code 的批注面板里，并随文字移动。在本地也可以处理，合作者会实时看到：
 
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo03-synctex.gif" height=400px/>
+| 操作 | 方法 |
+|---|---|
+| 添加批注 | 选中文字后右键选 `添加 Overleaf 批注`，或者点行号旁的 `+` 批注整行 |
+| 回复 | 展开批注，在下面的框里写 |
+| 编辑、删除 | 批注上的铅笔和垃圾桶，只有自己写的才有。删除批注会连同它的回复一起删除 |
+| 解决 | 批注标题上的 ✓。解决后它不再显示在正文和面板里，但记录还在 |
+| 重新打开 | 批注面板上方的 🕘 按钮 |
 
-- SyncTeX and Reverse SyncTeX
-  > <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd> to jump to PDF.
-  > Double click on PDF to jump to source code
+这些操作都是立刻显示、后台发送。如果 Overleaf 拒绝，改动会撤回，并提示原因和重试。
 
-- Chat with Collaborators
+所有批注也写在 `overleaf-<项目名>/.output/comments.md` 里，包括文件、行号、原文、作者和内容，方便任何工具读取。改动这个文件不会影响 Overleaf。
 
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo06-chat.gif" height=400px/>
+## 和 AI 助手一起用
 
-- Open Project Locally, Compile/Preview with [LaTeX-Workshop](https://github.com/James-Yu/LaTeX-Workshop)
+插件本身不包含 AI 功能，只负责让项目成为真实文件夹。在 VS Code 里打开论文文件夹后，AI 助手可以：
 
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo07-local.gif" height=400px/>
+- 直接修改 `overleaf-<项目名>/` 里的文件，修改会自动同步，合作者也会实时看到，和其他人的编辑一样；
+- 读取 `.output/comments.md` 了解批注；
+- 读取 `.output/output.log` 查看编译错误。
 
-### How to Login with Cookies
+## 设置
 
-<img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/login_with_cookie.png" height=400px/>
+| 设置 | 默认 | 作用 |
+|---|---|---|
+| `overleaf-workshop.projectManager.showOriginalOpenActions` | 关 | 在项目列表里显示原插件的打开方式：`Open Project in Current Window`、`Open Project in New Window`（虚拟文件夹）和 `Open Project Locally ...`（不会自动同步的旧本地副本） |
 
-In an already logged-in browser (Firefox for example):
+## 注意事项
 
-1. Open "Developer Tools" (usually by pressing <kbd>F12</kbd>) and switch to the "Network" tab;
+- **一个文件夹只能同步一个项目。** 同一个文件夹里有多个同步文件夹时，只有一个会同步，插件会提示。
+- **同一个文件夹不要同时用两个编辑器打开**（比如 VS Code 和 Cursor），也不要放在网盘的同步目录里。两边都会发送同一处修改，文字可能重复。
+- **`Ctrl+Z` 可能撤销合作者的修改。** 线上的修改会进入编辑器的撤销记录，所以连续撤销时可能把别人刚写的内容也撤掉，撤销的结果同样会同步。和合作者同时编辑一个文件时，撤销前请留意。
+- **保存时自动格式化的设置也会生效。** 打字会自动保存，所以开启了 `editor.formatOnSave` 或 `files.trimTrailingWhitespace` 的话，每次停顿都可能改动文件并同步给合作者，建议在这个工作区关闭。
+- **只有大小写不同的文件名**（`Intro.tex` 和 `intro.tex`）在 Windows 上是同一个文件，请避免。
+- **Cookie 会过期。** 过期后需要在 Overleaf 面板重新登录。
+- **这是非官方工具。** 它使用 Overleaf 网页版自己的接口，这些接口可能随时变化，Overleaf 的使用条款也对脚本化访问有限制，请自行判断。
+- **出错时可以回退。** Overleaf 自带的历史记录（History）可以恢复任何版本，第一次用在重要项目上时，建议先在历史记录里加一个标签。
+- **多人协作的验证还有限。** 同步和批注都在真实的 Overleaf 上测试过，包括两个连接同时编辑和断线重连，但用的是同一个账号，目前也只用过测试项目。合作者账号能否编辑、删除自己的批注还没有验证，如果 Overleaf 拒绝，界面会撤回并提示。
 
-   Then, navigate to the Overleaf main page (e.g., `https://www.overleaf.com`) in the address bar.
+## 开发
 
-2. Filter the listed items with `/project` and select the exact match.
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1
+```
 
-3. Check the "Cookie" under "Request Headers" of the selected item and copy its value to login.
-    > The format of the Cookie value would be like: `overleaf_session2=...` or `sharelatex.sid=...`
+运行全部测试。它们使用假的 Overleaf 响应，不需要账号。
 
-### Compatibility
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File test\dev-window.ps1 -Folder <文件夹>
+```
 
-The following Overleaf (ShareLatex) Community Edition docker images provided on [Docker Hub](https://hub.docker.com/r/sharelatex/sharelatex) have been tested and verified to be compatible with this extension.
+打开一个隔离的 VS Code 窗口，用真实账号试用当前代码，不影响你自己的 VS Code。
 
-- [x] [sharelatex/sharelatex:5.0.4](https://hub.docker.com/layers/sharelatex/sharelatex/5.0.4/images/sha256-429f6c4c02d5028172499aea347269220fb3505cbba2680f5c981057ffa59316?context=explore) (verified by [@Mingbo-Lee](https://github.com/Mingbo-Lee))
+## 来源
 
-- [x] [sharelatex/sharelatex:4.2.4](https://hub.docker.com/layers/sharelatex/sharelatex/4.2.4/images/sha256-ac0fc6dbda5e82b9c979721773aa120ad3c4a63469b791b16c3711e0b937528c?context=explore)
-
-- [x] [sharelatex/sharelatex:4.1](https://hub.docker.com/layers/sharelatex/sharelatex/4.1/images/sha256-3798913f1ada2da8b897f6b021972db7874982b23bef162019a9ac57471bcee8?context=explore) (verified by [@iamhyc](https://github.com/iamhyc))
-
-- [x] [sharelatex/sharelatex:3.5](https://hub.docker.com/layers/sharelatex/sharelatex/3.5/images/sha256-f97fa20e45cdbc688dc051cc4b0e0f4f91ae49fd12bded047d236ca389ad80ac?context=explore) (verified by [@iamhyc](https://github.com/iamhyc))
-
-- [ ] [sharelatex/sharelatex:3.4](https://hub.docker.com/layers/sharelatex/sharelatex/3.4/images/sha256-2a72e9b6343ed66f37ded4e6da8df81ed66e8af77e553b91bd19307f98badc7a?context=explore)
-
-- [ ] [sharelatex/sharelatex:3.3](https://hub.docker.com/layers/sharelatex/sharelatex/3.3/images/sha256-e1ec01563d259bbf290de4eb90dce201147c0aae5a07738c8c2e538f6d39d3a8?context=explore)
-
-- [ ] [sharelatex/sharelatex:3.2](https://hub.docker.com/layers/sharelatex/sharelatex/3.2/images/sha256-5db71af296f7c16910f8e8939e3841dad8c9ac48ea0a807ad47ca690087f44bf?context=explore)
-
-- [ ] [sharelatex/sharelatex:3.1](https://hub.docker.com/layers/sharelatex/sharelatex/3.1/images/sha256-5b9de1e65257cea4682c1654af06408af7f9c0e2122952d6791cdda45705e84e?context=explore)
-
-- [ ] [sharelatex/sharelatex:3.0](https://hub.docker.com/layers/sharelatex/sharelatex/3.0/images/sha256-a36e54c66ef62fdee736ce2229289aa261b44f083a9fd553cf8264500612db27?context=explore)
-
-### Development
-
-Please refer to the development guidance in [CONTRIBUTING.md](./CONTRIBUTING.md)
-
-### References
-
-- [Overleaf Official Logos](https://www.overleaf.com/for/partners/logos)
-- [Overleaf Web Route List](./docs/webapi.md)
-- [James-Yu/LaTeX-Workshop](https://github.com/James-Yu/LaTeX-Workshop)
-- [jlelong/vscode-latex-basics](https://github.com/jlelong/vscode-latex-basics/tags)
+基于 [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop) 开发。聊天、协作者光标、项目历史、SyncTeX 等功能来自原项目，详细说明见[原项目的文档](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki)。许可证见 [LICENSE](./LICENSE)。

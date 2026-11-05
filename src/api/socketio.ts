@@ -206,13 +206,22 @@ export class SocketIOAPI {
         });
 
         if (this.scheme==='v2') {
-            this.record = new Promise(resolve => {
-                this.socket.on('joinProjectResponse', (res:any) => {
-                    const publicId = res.publicId as string;
-                    const project = res.project as ProjectEntity;
-                    EventBus.fire('socketioConnectedEvent', {publicId});
-                    resolve(project);
-                });
+            // Each connection gets its own answer. An answer from before a disconnect describes a server session
+            // that has ended and documents at old versions, and using it means no more edits arrive.
+            let answer: (project:ProjectEntity) => void;
+            const expectAnswer = () => {
+                // Switching to invisible mode disconnects too, and has set the record it will use.
+                if (this.scheme==='v2') {
+                    this.record = new Promise(resolve => { answer = resolve; });
+                }
+            };
+            expectAnswer();
+            this.socket.on('disconnect', expectAnswer);
+            this.socket.on('joinProjectResponse', (res:any) => {
+                const publicId = res.publicId as string;
+                const project = res.project as ProjectEntity;
+                EventBus.fire('socketioConnectedEvent', {publicId});
+                answer(project);
             });
         }
     }

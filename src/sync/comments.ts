@@ -299,10 +299,19 @@ export class ProjectComments implements vscode.Disposable {
         return {authorId: this.me?.id, author: this.me?.name ?? '我', text, time: Date.now()};
     }
 
-    /** For the button on a thread in the editor. */
-    resolve(thread: vscode.CommentThread) {
+    /** For the button on a thread in the editor. A resolved comment leaves the text, so it asks first. */
+    async resolve(thread: vscode.CommentThread) {
         const comment = this.commentOf(thread);
-        if (comment) { this.setResolved(comment, true); }
+        if (comment && await this.confirmResolve()) { this.setResolved(comment, true); }
+    }
+
+    private async confirmResolve() {
+        const answer = await vscode.window.showInformationMessage(
+            '解决这条批注？',
+            {modal: true, detail: '它会从正文和批注面板中隐藏。记录会保留，可以用批注面板上方的按钮重新打开。'},
+            '解决',
+        );
+        return answer === '解决';
     }
 
     /** A resolved comment shows nowhere in the editor, so a mistaken click is undone from a list. */

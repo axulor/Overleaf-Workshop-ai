@@ -26,6 +26,7 @@ class FakeRemote {
     this.files = new Map(Object.entries(files).map(([p, c]) => [p, { content: Buffer.from(c), version: 1 }]));
     this.writes = [];
     this.removed = [];
+    this.renames = [];
     this.fileReads = 0;
     this.failWrites = false;
     this.changed = new vscode.EventEmitter();
@@ -41,12 +42,20 @@ class FakeRemote {
       ...[...this.files].map(([p, f]) => ({ path: p, kind: 'file', version: `${p}:${f.version}` })),
     ];
   }
-  async readDoc(p) { return this.docs.get(p); }
+  async readDoc(p) {
+    const text = this.docs.get(p);
+    const afterRead = this.afterRead;
+    this.afterRead = undefined;
+    if (afterRead) await afterRead(p); // something happening between reading the text and acting on it
+    return text;
+  }
   async readFile(p) { this.fileReads++; return new Uint8Array(this.files.get(p).content); }
-  async writeDoc(p, text) {
+  async writeDoc(p, text, basedOn) {
     if (this.failWrites) throw new Error('offline');
+    if (basedOn !== undefined && this.docs.get(p) !== basedOn) return false;
     this.writes.push({ path: p, text });
     this.docs.set(p, text);
+    return true;
   }
   async writeFile(p, content) {
     if (this.failWrites) throw new Error('offline');
@@ -60,6 +69,14 @@ class FakeRemote {
     }
   }
   async remove(p) { this.removed.push(p); this.docs.delete(p); this.files.delete(p); }
+  async rename(from, to) {
+    if (this.failWrites) throw new Error('offline');
+    if (this.renameDelayMs) await sleep(this.renameDelayMs);
+    this.renames.push({ from, to });
+    for (const store of [this.docs, this.files]) {
+      if (store.has(from)) { store.set(to, store.get(from)); store.delete(from); }
+    }
+  }
   // what a collaborator does
   edit(p, text) { this.docs.set(p, text); this.changed.fire(p); }
   replaceFile(p, content) { this.files.set(p, { content: Buffer.from(content), version: this.files.get(p).version + 1 }); this.changed.fire(undefined); }
@@ -598,6 +615,54 @@ async function testReplaceDocContent(VirtualFileSystem, GlobalStateManager) {
   await t.vfs.replaceDocContent(DOC_URI, 'Works.\n');
   check('in turn: a failed update does not hold up the next', server.text === 'Works.\n', JSON.stringify(server.text));
 
+  // an edit that arrived after the caller read the text
+  server = { text: 'Base.\n', version: 3 };
+  t = make(server);
+  await t.vfs.openFile(DOC_URI);
+  let sentCount = t.sent.length;
+  check('based on: the text it was based on is still there, so it is sent', await t.vfs.replaceDocContent(DOC_URI, 'Base one.\n', 'Base.\n') === true && server.text === 'Base one.\n' && t.sent.length === sentCount + 1);
+  sentCount = t.sent.length;
+  check('based on: if the text has moved on, nothing is sent', await t.vfs.replaceDocContent(DOC_URI, 'Other.\n', 'Base.\n') === false && server.text === 'Base one.\n' && t.sent.length === sentCount, JSON.stringify(server.text));
+
+  // files
+  server = { text: 'Base.\n', version: 3 };
+  t = make(server);
+  const fileUri = ORIGIN.with({ path: '/Test/figure.png' });
+  const rootFolder = t.vfs.root.rootFolder[0];
+  rootFolder.fileRefs.push({ _id: 'old-file', name: 'figure.png' });
+  t.vfs.api = { uploadFile: async () => ({ type: 'error', message: '422: too big' }) };
+  let refused;
+  await t.vfs.createFile(fileUri, new Uint8Array([1]), true).catch((e) => { refused = e; });
+  check('uploading: a refusal is an error for the caller, not a quiet nothing', refused?.message === '422: too big', String(refused));
+  check('uploading: and the old file stays listed', rootFolder.fileRefs.length === 1 && rootFolder.fileRefs[0]._id === 'old-file');
+  t.vfs.api = { uploadFile: async () => ({ type: 'success', entity: { _id: 'new-file', _type: 'file', name: 'figure.png' } }) };
+  await t.vfs.createFile(fileUri, new Uint8Array([1]), true);
+  check('uploading: a replaced file is listed once, under its new id', rootFolder.fileRefs.length === 1 && rootFolder.fileRefs[0]._id === 'new-file', JSON.stringify(rootFolder.fileRefs));
+  t.handlers.onFileCreated('root', 'file', { _id: 'new-file', name: 'figure.png' });
+  check('uploading: and the server announcing it changes nothing', rootFolder.fileRefs.length === 1, JSON.stringify(rootFolder.fileRefs));
+
+  // folders on Overleaf
+  server = { text: 'Base.\n', version: 3 };
+  t = make(server);
+  const projectRoot = t.vfs.root.rootFolder[0];
+  projectRoot.folders.push({ _id: 'folder1', name: 'sections', docs: [{ _id: 'doc2', name: 'a.tex' }], fileRefs: [], folders: [] });
+  const found = t.vfs._resolveById('folder1');
+  check('folders: a folder is found with its parent', found.parentFolder === projectRoot && found.fileType === 'folder' && found.fileEntity.name === 'sections', JSON.stringify(found.path));
+  projectRoot.folders.push({ _id: 'folder2', name: 'target', docs: [], fileRefs: [], folders: [] });
+  t.handlers.onFileMoved('doc2', 'folder2');
+  const target = projectRoot.folders.find((f) => f._id === 'folder2');
+  check('moves: a file moves to the other folder', target.docs.length === 1 && t.vfs._resolveById('doc2').parentFolder === target);
+  t.handlers.onFileMoved('doc2', 'folder2');
+  check('moves: and stays there when the server announces a move already applied', target.docs.length === 1, JSON.stringify(target.docs));
+  t.handlers.onFileRemoved('folder1');
+  check('folders: deleted online, it leaves the list', !projectRoot.folders.some((f) => f._id === 'folder1'), JSON.stringify(projectRoot.folders));
+
+  const { VfsRemoteSide } = require(path.join(out, 'sync', 'vfsRemoteSide.js'));
+  const quiet = () => ({ dispose() {} });
+  const side = new VfsRemoteSide({ pathToUri: () => DOC_URI, openFile: async () => new TextEncoder().encode('\uFEFFwith a mark\n') }, { onDidChangeFile: quiet });
+  check('a byte order mark online is read as it is, as writes state the text they were based on', await side.readDoc('main.tex') === '\uFEFFwith a mark\n', JSON.stringify(await side.readDoc('main.tex')));
+  side.dispose();
+
   // handlers survive a new socket, as overleaf.com refuses the first kind of connection
   let registered = 0, recreated = 0;
   const vfs = Object.create(VirtualFileSystem.prototype);
@@ -858,8 +923,15 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   check('setup: two comments are showing', !!thread('t1') && !!thread('t2'));
 
   // resolving
+  const resolveAsked = [];
+  let resolveAnswer = false;
+  comments.confirmResolve = async () => { resolveAsked.push(thread('t1') ? 't1' : 'gone'); return resolveAnswer; };
+  await comments.resolve(thread('t1'));
+  check('resolving: it asks first, as the comment leaves the text', resolveAsked.length === 1);
+  check('resolving: saying no changes nothing', !!thread('t1') && source.changes.length === 0);
+  resolveAnswer = true;
   hold();
-  comments.resolve(thread('t1'));
+  await comments.resolve(thread('t1'));
   check('resolving: the comment leaves the text at once, while the server has not answered', !thread('t1') && !!thread('t2') && source.changes.length === 0, JSON.stringify(source.changes));
   check('resolving: the plain file follows', await until(() => listing().includes('## Open (1)') && listing().includes('## Resolved (1)')), listing());
   release();
@@ -896,7 +968,7 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   let reads = source.reads;
   emitter.fire();
   await until(() => source.reads > reads);
-  comments.resolve(thread('t1'));
+  await comments.resolve(thread('t1'));
   await comments.whenSent();
   answerHeld();
   source.holdRead = undefined;
@@ -908,7 +980,7 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   firstOfT('t1').resolved = false;
   await refreshed();
   hold();
-  comments.resolve(thread('t1'));
+  await comments.resolve(thread('t1'));
   reads = source.reads;
   emitter.fire();
   await sleep(800);
@@ -923,7 +995,7 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   // Overleaf refusing
   clearErrors();
   source.refuse = true;
-  comments.resolve(thread('t1'));
+  await comments.resolve(thread('t1'));
   check('refused: at first the comment leaves', !thread('t1'));
   await comments.whenSent();
   check('refused: then it comes back', !!thread('t1'));
@@ -1121,7 +1193,7 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   hold();
   await comments.submit({ thread: box, text: 'quick' });
   await comments.submit({ thread: box, text: 'quick reply' });
-  comments.resolve(box);
+  await comments.resolve(box);
   check('in order: all of it shows at once', !thread(threadIdOf(box) ?? 'none'));
   release();
   await comments.whenSent();
@@ -1194,6 +1266,391 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   check('comments: nothing is written after stopping', listing() === finalText);
   emitter.dispose();
   fs.rmSync(folder, { recursive: true, force: true });
+}
+
+// ---- what must not happen to a shared manuscript ----
+
+async function testSafety(FolderSync, { mergeText, findUnsupportedCharacter }) {
+  // choosing a side decides only the places that overlap
+  const lines = 'The first sentence stays as it is.\nThe second sentence is what both change.\nThe third sentence stays as it is.\nThe fourth sentence stays as it is.\n';
+  const mine = lines.replace('first', 'FIRST').replace('second sentence', 'second line, mine');
+  const theirs = lines.replace('fourth', 'FOURTH').replace('second sentence', 'second line, theirs');
+  let m = mergeText(lines, mine, theirs, 'local');
+  check('choice: the local side wins where they overlap, and changes elsewhere stay', m.ok && m.text === lines.replace('first', 'FIRST').replace('second sentence', 'second line, mine').replace('fourth', 'FOURTH'), JSON.stringify(m));
+  m = mergeText(lines, mine, theirs, 'online');
+  check('choice: the online side wins where they overlap, and changes elsewhere stay', m.ok && m.text === lines.replace('first', 'FIRST').replace('second sentence', 'second line, theirs').replace('fourth', 'FOURTH'), JSON.stringify(m));
+  const wide = mergeText('aaa bbb ccc ddd eee', 'aaa XXXXXXXXXXX eee', 'aaa B ccc D eee', 'local');
+  check('choice: one wide edit against two small ones is decided as a whole', wide.ok && wide.text === 'aaa XXXXXXXXXXX eee', JSON.stringify(wide));
+  const wideOnline = mergeText('aaa bbb ccc ddd eee', 'aaa XXXXXXXXXXX eee', 'aaa B ccc D eee', 'online');
+  check('choice: and from the other side too', wideOnline.ok && wideOnline.text === 'aaa B ccc D eee', JSON.stringify(wideOnline));
+  check('choice: without a preference it stays a conflict', !mergeText('one\n', 'ONE mine\n', 'ONE theirs\n').ok);
+
+  check('characters: ordinary text and Chinese are fine', findUnsupportedCharacter('疫苗 é – x\n') === undefined);
+  const emoji = findUnsupportedCharacter('one\ntwo 😀 three\n');
+  check('characters: an emoji is found, with its line', emoji?.character === '😀' && emoji.line === 2, JSON.stringify(emoji));
+
+  // ---- someone's edit arrives just after the text was read ----
+  let c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'one\ntwo\nthree\n' }));
+  c.remote.afterRead = (p) => { c.remote.docs.set(p, 'one\ntwo\nthree\nfour from Bob\n'); };
+  c.write('main.tex', 'ONE\ntwo\nthree\n');
+  check('arriving late: a push does not remove their edit', await until(() => c.remote.docs.get('main.tex') === 'ONE\ntwo\nthree\nfour from Bob\n'), JSON.stringify(c.remote.docs.get('main.tex')));
+  check('arriving late: and the local file has both', await until(() => c.read('main.tex') === 'ONE\ntwo\nthree\nfour from Bob\n'), JSON.stringify(c.read('main.tex')));
+  c.sync.dispose();
+
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'one\ntwo\nthree\n' }));
+  c.sync.options.confirmRemoteDelete = async () => false;
+  c.remote.docs.set('main.tex', 'one\ntwo\nthree\nabc\n');
+  c.remote.afterRead = (p) => { c.remote.docs.set(p, 'one\ntwo\nthree\nabcd\n'); };
+  c.write('main.tex', 'ONE\ntwo\nthree\n');
+  await until(() => c.remote.docs.get('main.tex') === 'ONE\ntwo\nthree\nabcd\n');
+  check('arriving late: a merge does not remove their newest typing', c.remote.docs.get('main.tex') === 'ONE\ntwo\nthree\nabcd\n', JSON.stringify(c.remote.docs.get('main.tex')));
+  check('arriving late: someone who keeps typing causes no false conflict', c.sync.status.conflicts.length === 0, JSON.stringify(c.sync.status.conflicts));
+  check('arriving late: and the local file has everything', await until(() => c.read('main.tex') === 'ONE\ntwo\nthree\nabcd\n'), JSON.stringify(c.read('main.tex')));
+  c.sync.dispose();
+
+  // ---- typing at the moment an online edit is applied ----
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'one\ntwo\nthree\n' }));
+  let document = await vscode.workspace.openTextDocument(path.join(c.root, 'main.tex'));
+  await vscode.window.showTextDocument(document);
+  c.remote.docs.set('main.tex', 'one\ntwo\nthree\nfrom Bob\n');
+  c.remote.afterRead = async () => {
+    const edit = new vscode.WorkspaceEdit();
+    edit.insert(document.uri, new vscode.Position(0, 0), 'typed ');
+    await vscode.workspace.applyEdit(edit);
+  };
+  c.remote.changed.fire('main.tex');
+  check('typing: what was typed while an edit arrived is not lost', await until(() => c.remote.docs.get('main.tex') === 'typed one\ntwo\nthree\nfrom Bob\n'), JSON.stringify(c.remote.docs.get('main.tex')));
+  check('typing: and the editor shows both', await until(() => document.getText().replace(/\r\n/g, '\n') === 'typed one\ntwo\nthree\nfrom Bob\n'), JSON.stringify(document.getText()));
+  c.remote.edit('main.tex', 'typed one\ntwo\nthree\nfrom Bob\nmore\n');
+  check('an open file: an online edit reaches the editor at once, not after a reload', await until(() => document.getText().replace(/\r\n/g, '\n').endsWith('more\n')), JSON.stringify(document.getText()));
+  check('an open file: and it is saved', await until(() => !document.isDirty && c.read('main.tex').replace(/\r\n/g, '\n').endsWith('more\n')));
+  await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  c.sync.dispose();
+
+  // ---- a tool writing a file it read some time ago: held, and the user decides ----
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'first line\nsecond line\nthird line\n' }));
+  c.remote.edit('main.tex', 'first line\nsecond line by Bob\nthird line\n');
+  await until(() => c.read('main.tex').includes('by Bob'));
+  await sleep(SETTLE_MS);
+  let writesHere = c.remote.writes.length;
+  const oldCopy = 'first line\nsecond line\nthird line\na line from a tool\n';
+  c.write('main.tex', oldCopy);
+  check('an old copy: it is held, not sent', await until(() => c.sync.status.conflicts.some((x) => x.reason === 'olderCopy')), JSON.stringify(c.sync.status.conflicts));
+  check('an old copy: the online edit is untouched', c.remote.writes.length === writesHere && c.remote.docs.get('main.tex').includes('by Bob'), JSON.stringify(c.remote.docs.get('main.tex')));
+  check('an old copy: the tool\'s file is untouched', c.read('main.tex') === oldCopy);
+  check('an old copy: the user is asked once', c.conflicts.filter((x) => x.reason === 'olderCopy').length === 1, JSON.stringify(c.conflicts));
+  c.sync.lastReceived.get('main.tex').at = 0;
+  await c.sync.flush();
+  await sleep(SETTLE_MS);
+  check('an old copy: it stays held however long the choice takes', c.remote.writes.length === writesHere && c.sync.status.conflicts.some((x) => x.reason === 'olderCopy'), JSON.stringify(c.remote.writes));
+  c.remote.edit('main.tex', 'first line\nsecond line by Bob\nthird line\nmore by Bob\n');
+  await sleep(SETTLE_MS);
+  check('an old copy: further online edits do not overwrite it', c.read('main.tex') === oldCopy);
+  await c.sync.stop();
+  c.conflicts.length = 0;
+  c.sync = c.make();
+  await c.sync.start();
+  await sleep(SETTLE_MS);
+  check('an old copy: reloading the window does not send it', c.remote.writes.length === writesHere && c.read('main.tex') === oldCopy, JSON.stringify(c.remote.writes));
+  check('an old copy: and the user is asked again', c.sync.status.conflicts.some((x) => x.reason === 'olderCopy') && c.conflicts.some((x) => x.reason === 'olderCopy'), JSON.stringify(c.sync.status));
+  await c.sync.resolveConflict('main.tex', 'online');
+  check('an old copy: choosing online brings the online text', c.read('main.tex') === 'first line\nsecond line by Bob\nthird line\nmore by Bob\n', JSON.stringify(c.read('main.tex')));
+  check('an old copy: and the tool\'s version is kept', fs.readFileSync(c.sync.discardedCopyUri('main.tex').fsPath, 'utf8') === oldCopy);
+  check('an old copy: it is settled', c.sync.status.conflicts.length === 0);
+  await sleep(SETTLE_MS);
+  const afterChoice = c.read('main.tex');
+  c.write('main.tex', `${afterChoice}a change after choosing\n`);
+  check('an old copy: after choosing online, the next change just goes', await until(() => c.remote.docs.get('main.tex') === `${afterChoice}a change after choosing\n`) && c.sync.status.conflicts.length === 0, JSON.stringify(c.sync.status));
+  await sleep(SETTLE_MS);
+  c.write('main.tex', afterChoice);
+  await until(() => c.remote.docs.get('main.tex') === afterChoice);
+  await sleep(SETTLE_MS);
+
+  c.remote.edit('main.tex', 'first line\nsecond line by Bob, again\nthird line\nmore by Bob\n');
+  await until(() => c.read('main.tex').includes('again'));
+  await sleep(SETTLE_MS);
+  c.write('main.tex', 'an old copy kept on purpose\n');
+  await until(() => c.sync.status.conflicts.some((x) => x.reason === 'olderCopy'));
+  await c.sync.resolveConflict('main.tex', 'local');
+  check('an old copy: choosing local sends it', c.remote.docs.get('main.tex') === 'an old copy kept on purpose\n', JSON.stringify(c.remote.docs.get('main.tex')));
+  await sleep(SETTLE_MS);
+  c.write('main.tex', 'and later changes just go\n');
+  check('an old copy: and nothing is held after that', await until(() => c.remote.docs.get('main.tex') === 'and later changes just go\n'), JSON.stringify(c.sync.status));
+  await c.sync.stop();
+  c.sync = c.make();
+  await c.sync.start();
+  await sleep(SETTLE_MS);
+  c.write('main.tex', 'and after a reload too\n');
+  check('an old copy: not after a reload either', await until(() => c.remote.docs.get('main.tex') === 'and after a reload too\n'), JSON.stringify(c.sync.status));
+  c.sync.dispose();
+
+  // written at the very moment an edit arrived: nothing is lost, and nobody needs asking
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'first line\nsecond line\nthird line\n' }));
+  c.remote.edit('main.tex', 'first line\nsecond line by Bob\nthird line\n');
+  await until(() => c.read('main.tex').includes('by Bob'));
+  c.write('main.tex', 'first line\nsecond line\nthird line\nfrom a tool\n');
+  check('just missed: both edits are kept', await until(() => c.remote.docs.get('main.tex') === 'first line\nsecond line by Bob\nthird line\nfrom a tool\n'), JSON.stringify(c.remote.docs.get('main.tex')));
+  check('just missed: and the local file has both', await until(() => c.read('main.tex') === 'first line\nsecond line by Bob\nthird line\nfrom a tool\n'), JSON.stringify(c.read('main.tex')));
+  check('just missed: nobody is asked', c.sync.status.conflicts.length === 0 && c.conflicts.length === 0, JSON.stringify(c.sync.status));
+  c.sync.dispose();
+
+  // lacking the edit before as well is no moment's overlap, however new the last one is
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'first line\nsecond line\nthird line\nfourth line\n' }));
+  c.remote.edit('main.tex', 'first line by Bob\nsecond line\nthird line\nfourth line\n');
+  await until(() => c.read('main.tex').includes('first line by Bob'));
+  await sleep(SETTLE_MS);
+  c.remote.edit('main.tex', 'first line by Bob\nsecond line\nthird line\nfourth line by Bob\n');
+  await until(() => c.read('main.tex').includes('fourth line by Bob'));
+  writesHere = c.remote.writes.length;
+  c.write('main.tex', 'first line\nsecond line from a tool\nthird line\nfourth line\n');
+  check('not just missed: an older copy is held however new the last edit is', await until(() => c.sync.status.conflicts.some((x) => x.reason === 'olderCopy')), JSON.stringify(c.sync.status));
+  check('not just missed: and nothing is sent', c.remote.writes.length === writesHere, JSON.stringify(c.remote.writes));
+  c.sync.dispose();
+
+  // ...while someone keeps typing, which makes it a merge rather than a push
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'paragraph A here\nparagraph B here\nparagraph C here\n' }));
+  c.remote.edit('main.tex', 'paragraph A here\nparagraph B by Bob\nparagraph C here\n');
+  await until(() => c.read('main.tex').includes('B by Bob'));
+  await sleep(SETTLE_MS);
+  c.remote.docs.set('main.tex', 'paragraph A here\nparagraph B by Bob\nparagraph C by Bob\n');
+  c.write('main.tex', 'paragraph A by a tool\nparagraph B here\nparagraph C here\n');
+  check('an old copy while someone types: it is held too', await until(() => c.sync.status.conflicts.some((x) => x.reason === 'olderCopy')), JSON.stringify(c.sync.status));
+  check('an old copy while someone types: their edits are untouched', c.remote.docs.get('main.tex') === 'paragraph A here\nparagraph B by Bob\nparagraph C by Bob\n', JSON.stringify(c.remote.docs.get('main.tex')));
+  c.sync.dispose();
+
+  // ...with the file open, where edits arriving also save it
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'first line\nsecond line\nthird line\n' }));
+  document = await vscode.workspace.openTextDocument(path.join(c.root, 'main.tex'));
+  await vscode.window.showTextDocument(document);
+  c.remote.edit('main.tex', 'first line\nsecond line by Bob\nthird line\n');
+  await until(() => document.getText().replace(/\r\n/g, '\n').includes('by Bob') && !document.isDirty);
+  await sleep(SETTLE_MS);
+  writesHere = c.remote.writes.length;
+  c.write('main.tex', 'first line\nsecond line\nthird line\nfrom a tool\n');
+  check('an old copy over an open file: it is held too', await until(() => c.sync.status.conflicts.some((x) => x.reason === 'olderCopy')), JSON.stringify(c.sync.status));
+  check('an old copy over an open file: the online edit is untouched', c.remote.writes.length === writesHere, JSON.stringify(c.remote.writes));
+  await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  c.sync.dispose();
+
+  // what a tool normally does
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'first line\nsecond line\nthird line\nfourth line\n' }));
+  await sleep(SETTLE_MS);
+  c.write('main.tex', 'first line\nsecond line\nthird line\nfourth line\na sentence of mine\n');
+  await until(() => c.remote.docs.get('main.tex').includes('a sentence of mine'));
+  await sleep(SETTLE_MS);
+  c.remote.edit('main.tex', 'first line by Bob\nsecond line\nthird line\nfourth line\na sentence of mine\n');
+  await until(() => c.read('main.tex').includes('by Bob'));
+  await sleep(SETTLE_MS);
+  c.write('main.tex', 'first line by Bob\nsecond line\nthird line by a tool\nfourth line\na sentence of mine\n');
+  check('an up-to-date copy is just a change', await until(() => c.remote.docs.get('main.tex').includes('by a tool')) && c.sync.status.conflicts.length === 0, JSON.stringify(c.sync.status));
+  await sleep(SETTLE_MS);
+  c.write('main.tex', 'first line by Bob\nsecond line\nthird line by a tool\nfourth line\n');
+  check('removing: my own text can be removed with a collaborator around', await until(() => c.remote.docs.get('main.tex') === 'first line by Bob\nsecond line\nthird line by a tool\nfourth line\n'), JSON.stringify(c.remote.docs.get('main.tex')));
+  await sleep(SETTLE_MS);
+  check('removing: and is not put back', c.read('main.tex') === 'first line by Bob\nsecond line\nthird line by a tool\nfourth line\n' && c.sync.status.conflicts.length === 0, JSON.stringify(c.sync.status));
+  c.write('main.tex', 'first line\nsecond line\nthird line by a tool\nfourth line\n');
+  check('removing what just arrived: the user is asked', await until(() => c.sync.status.conflicts.some((x) => x.reason === 'olderCopy')), JSON.stringify(c.sync.status));
+  await c.sync.resolveConflict('main.tex', 'local');
+  check('removing what just arrived: and it goes if they say so', c.remote.docs.get('main.tex') === 'first line\nsecond line\nthird line by a tool\nfourth line\n', JSON.stringify(c.remote.docs.get('main.tex')));
+  c.sync.dispose();
+
+  // taking out someone's text in the editor is a decision, and later versions need not have it
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'a\nb\nc\n' }));
+  document = await vscode.workspace.openTextDocument(path.join(c.root, 'main.tex'));
+  await vscode.window.showTextDocument(document);
+  c.remote.edit('main.tex', 'a\nb from Bob\nc\n');
+  await until(() => document.getText().replace(/\r\n/g, '\n') === 'a\nb from Bob\nc\n');
+  await sleep(SETTLE_MS);
+  const removal = new vscode.WorkspaceEdit();
+  removal.delete(document.uri, new vscode.Range(1, 1, 1, 'b from Bob'.length));
+  await vscode.workspace.applyEdit(removal);
+  check('in the editor: removing someone\'s text is a decision, and reaches Overleaf', await until(() => c.remote.docs.get('main.tex') === 'a\nb\nc\n'), JSON.stringify(c.remote.docs.get('main.tex')));
+  await sleep(SETTLE_MS);
+  check('in the editor: nobody is asked', document.getText().replace(/\r\n/g, '\n') === 'a\nb\nc\n' && c.sync.status.conflicts.length === 0, JSON.stringify(c.sync.status));
+  await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  await sleep(300);
+  c.write('main.tex', 'a\nb\nc\nd from a tool\n');
+  check('in the editor: and a tool editing after that is not held', await until(() => c.remote.docs.get('main.tex') === 'a\nb\nc\nd from a tool\n') && c.sync.status.conflicts.length === 0, JSON.stringify(c.sync.status));
+  c.sync.dispose();
+
+  // ---- Windows line endings in an open file ----
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'one\n\ntwo\n' }), {});
+  c.sync.dispose();
+  fs.writeFileSync(path.join(c.root, 'main.tex'), 'one\r\n\r\ntwo\r\n');
+  c.sync = c.make();
+  await c.sync.start();
+  document = await vscode.workspace.openTextDocument(path.join(c.root, 'main.tex'));
+  await vscode.window.showTextDocument(document);
+  await until(() => document.eol === vscode.EndOfLine.CRLF);
+  c.remote.edit('main.tex', 'one\nnew line by Bob\n\ntwo\n');
+  check('line endings: an edit before an empty line adds no extra line', await until(() => document.getText() === 'one\r\nnew line by Bob\r\n\r\ntwo\r\n'), JSON.stringify(document.getText()));
+  await sleep(SETTLE_MS);
+  check('line endings: and nothing extra goes online', c.remote.docs.get('main.tex') === 'one\nnew line by Bob\n\ntwo\n', JSON.stringify(c.remote.docs.get('main.tex')));
+  check('line endings: the file keeps them', c.read('main.tex') === 'one\r\nnew line by Bob\r\n\r\ntwo\r\n', JSON.stringify(c.read('main.tex')));
+  await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  c.sync.dispose();
+
+  // ---- choosing a side in a conflict ----
+  const conflicted = async () => {
+    const each = await setup(FolderSync, new FakeRemote({ 'main.tex': 'one\ntwo\nthree\nfour\n' }));
+    await each.sync.flush();
+    each.sync.dispose();
+    fs.writeFileSync(path.join(each.root, 'main.tex'), 'ONE\ntwo mine\nthree\nfour\n');
+    each.remote.docs.set('main.tex', 'one\ntwo theirs\nthree\nFOUR\n');
+    each.sync = each.make();
+    await each.sync.start();
+    await until(() => each.sync.status.conflicts.length === 1);
+    return each;
+  };
+  c = await conflicted();
+  check('choice: setup is a conflict', c.sync.status.conflicts[0]?.reason === 'sameRegion', JSON.stringify(c.sync.status.conflicts));
+  await c.sync.resolveConflict('main.tex', 'local');
+  check('choice: keeping local takes it where they overlap and leaves their other edits', c.remote.docs.get('main.tex') === 'ONE\ntwo mine\nthree\nFOUR\n' && c.read('main.tex') === 'ONE\ntwo mine\nthree\nFOUR\n', JSON.stringify(c.remote.docs.get('main.tex')));
+  check('choice: it is settled', c.sync.status.conflicts.length === 0);
+  c.sync.dispose();
+
+  c = await conflicted();
+  await c.sync.resolveConflict('main.tex', 'online');
+  check('choice: keeping online takes it where they overlap and leaves your other edits', c.remote.docs.get('main.tex') === 'ONE\ntwo theirs\nthree\nFOUR\n' && c.read('main.tex') === 'ONE\ntwo theirs\nthree\nFOUR\n', JSON.stringify(c.read('main.tex')));
+  check('choice: the local version is kept in case that was a mistake', fs.readFileSync(c.sync.discardedCopyUri('main.tex').fsPath, 'utf8') === 'ONE\ntwo mine\nthree\nfour\n');
+  c.sync.dispose();
+
+  // ---- what Overleaf cannot take ----
+  const problems = [];
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'one\ntwo\n' }), {}, { onProblem: (p, problem) => problems.push({ p, problem }) });
+  const writesBefore = c.remote.writes.length;
+  c.write('main.tex', 'one\ntwo 😀\n');
+  await until(() => c.sync.status.failed.includes('main.tex'));
+  check('an emoji: the file shows as not synced', c.sync.status.failed.includes('main.tex'), JSON.stringify(c.sync.status));
+  check('an emoji: nothing is sent, as Overleaf would drop the connection and lose the edit', c.remote.writes.length === writesBefore && c.remote.docs.get('main.tex') === 'one\ntwo\n');
+  check('an emoji: the user is told what and where, once', problems.length === 1 && problems[0].problem.character === '😀' && problems[0].problem.line === 2, JSON.stringify(problems));
+  check('an emoji: the local file is left alone', c.read('main.tex') === 'one\ntwo 😀\n');
+  c.write('main.tex', 'one\ntwo smile\n');
+  check('an emoji: once it is gone the file syncs', await until(() => c.remote.docs.get('main.tex') === 'one\ntwo smile\n' && c.sync.status.failed.length === 0), JSON.stringify(c.sync.status));
+  problems.length = 0;
+  c.write('main.tex', Buffer.from([0x61, 0xff, 0xfe, 0x62]));
+  await until(() => c.sync.status.failed.includes('main.tex'));
+  check('another encoding: the file shows as not synced', c.sync.status.failed.includes('main.tex'));
+  check('another encoding: and the user is told', problems.length === 1 && problems[0].problem.kind === 'notUtf8', JSON.stringify(problems));
+  check('another encoding: nothing is sent', c.remote.docs.get('main.tex') === 'one\ntwo smile\n');
+  c.write('main.tex', 'one\ntwo smile\n');
+  await until(() => c.sync.status.failed.length === 0);
+  c.sync.dispose();
+
+  // ---- a failed upload is not a success ----
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'x\n' }, { 'figures/a.png': 'OLD' }));
+  c.remote.failWrites = true;
+  c.write('figures/a.png', 'NEW');
+  await until(() => c.sync.status.failed.includes('figures/a.png'));
+  check('a failed replacement shows as not synced', c.sync.status.failed.includes('figures/a.png'), JSON.stringify(c.sync.status));
+  c.remote.failWrites = false;
+  check('and is sent once it can be', await until(() => Buffer.from(c.remote.files.get('figures/a.png').content).toString() === 'NEW', 10000));
+  c.sync.dispose();
+
+  // ---- renaming ----
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'x\n', 'old name.tex': 'the section\n' }, { 'figures/a.png': 'PNG' }));
+  await sleep(SETTLE_MS);
+  let writes = c.remote.writes.length;
+  c.remove('old name.tex');
+  c.write('new name.tex', 'the section\n');
+  check('renaming: the document is renamed online, keeping its comments', await until(() => c.remote.renames.some((r) => r.from === 'old name.tex' && r.to === 'new name.tex')), JSON.stringify(c.remote.renames));
+  await sleep(SETTLE_MS);
+  check('renaming: nothing is uploaded', c.remote.writes.length === writes, JSON.stringify(c.remote.writes));
+  check('renaming: and nobody is asked about deleting', c.asked.length === 0 && c.remote.removed.length === 0, JSON.stringify(c.asked));
+  // a rename slower than the question about deleting
+  c.answer = true;
+  c.remote.renameDelayMs = 1500;
+  c.remove('new name.tex');
+  c.write('slow name.tex', 'the section\n');
+  check('renaming slowly: it is still renamed', await until(() => c.remote.renames.some((r) => r.to === 'slow name.tex'), 8000), JSON.stringify(c.remote.renames));
+  await sleep(SETTLE_MS);
+  check('renaming slowly: and the document is not deleted while that happens', c.remote.removed.length === 0 && c.remote.docs.has('slow name.tex'), JSON.stringify([c.remote.removed, [...c.remote.docs.keys()]]));
+  check('renaming slowly: nobody is asked', c.asked.length === 0, JSON.stringify(c.asked));
+  c.answer = false;
+  c.remote.renameDelayMs = 0;
+  c.remove('slow name.tex');
+  c.write('new name.tex', 'the section\n');
+  await until(() => c.remote.docs.has('new name.tex'));
+  await sleep(SETTLE_MS);
+
+  c.write('new name.tex', 'the section, edited\n');
+  check('renaming: later edits go to the renamed document', await until(() => c.remote.docs.get('new name.tex') === 'the section, edited\n'));
+  c.remove('figures/a.png');
+  c.write('elsewhere/a.png', 'PNG');
+  check('renaming: moving a file to another folder under its name is followed too', await until(() => c.remote.renames.some((r) => r.to === 'elsewhere/a.png')), JSON.stringify(c.remote.renames));
+  await sleep(SETTLE_MS);
+  c.answer = true;
+  writes = c.remote.writes.length;
+  c.remove('new name.tex');
+  c.write('other/different.tex', 'the section, edited\n');
+  check('renaming: moved and renamed at once is an upload and a delete', await until(() => c.remote.docs.get('other/different.tex') === 'the section, edited\n' && !c.remote.docs.has('new name.tex'), 8000), JSON.stringify([...c.remote.docs.keys()]));
+  check('renaming: and the delete is asked about', c.asked.length === 1, JSON.stringify(c.asked));
+  c.asked.length = 0;
+  writes = c.remote.writes.length;
+  c.write('copy.tex', 'x\n');
+  await until(() => c.remote.docs.has('copy.tex'));
+  check('renaming: a copy is not a rename', c.remote.renames.every((r) => r.to !== 'copy.tex') && c.remote.docs.get('main.tex') === 'x\n');
+  c.sync.dispose();
+
+  // renaming a folder arrives file by file, and the question about deleting must wait for all of it
+  c = await setup(FolderSync, new FakeRemote({ 'part/a.tex': 'text of a\n', 'part/b.tex': 'text of b\n', 'part/c.tex': 'text of c\n', 'main.tex': 'x\n' }));
+  await sleep(SETTLE_MS);
+  c.remote.renameDelayMs = 700;
+  fs.renameSync(path.join(c.root, 'part'), path.join(c.root, 'moved'));
+  check('renaming a folder: every file is renamed', await until(() => ['a', 'b', 'c'].every((n) => c.remote.docs.has(`moved/${n}.tex`)), 15000), JSON.stringify([...c.remote.docs.keys()]));
+  await sleep(SETTLE_MS);
+  check('renaming a folder: nobody is asked about deleting along the way', c.asked.length === 0 && c.remote.removed.length === 0, JSON.stringify(c.asked));
+  c.remote.renameDelayMs = 0;
+  c.sync.dispose();
+
+  // a second problem in the same file is told too
+  const told = [];
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'x\n' }), {}, { onProblem: (p, problem) => told.push(problem.character) });
+  c.write('main.tex', 'x 😀\n');
+  await until(() => told.length === 1);
+  c.write('main.tex', 'x 🎉\n');
+  check('a second bad character is told as well', await until(() => told.length === 2, 12000), JSON.stringify(told));
+  check('the status lists it as waiting for a change', c.sync.status.refused.includes('main.tex'), JSON.stringify(c.sync.status));
+  c.write('main.tex', 'x\n');
+  check('and not once it is fixed', await until(() => c.sync.status.refused.length === 0 && c.sync.status.failed.length === 0, 12000), JSON.stringify(c.sync.status));
+  c.sync.dispose();
+
+  // ---- the engine's own files ----
+  c = await setup(FolderSync, new FakeRemote({ 'main.tex': 'x\n' }), {}, { ignorePatterns: ['**/*.aux'] });
+  await sleep(SETTLE_MS);
+  writes = c.remote.writes.length;
+  c.write('.output/output.log', 'log');
+  c.write('.git/HEAD', 'ref');
+  c.write('.overleaf/settings.json', '{}');
+  c.write('notes.aux', 'aux');
+  await c.sync.flush();
+  await sleep(SETTLE_MS);
+  check('own patterns: the engine\'s folders still stay out of the project', c.remote.writes.length === writes, JSON.stringify(c.remote.writes));
+  c.sync.dispose();
+}
+
+async function testConnection(SocketIOAPI) {
+  const listeners = {};
+  const socket = {
+    on(name, fn) { (listeners[name] = listeners[name] ?? []).push(fn); },
+    emit() {},
+    removeAllListeners() { for (const name of Object.keys(listeners)) delete listeners[name]; },
+    disconnect() {},
+  };
+  const fire = (name, ...args) => (listeners[name] ?? []).forEach((fn) => fn(...args));
+  const api = new SocketIOAPI('https://www.overleaf.com/', { _initSocketV0: () => socket }, { cookies: '', csrfToken: '' }, 'p1');
+  api.scheme = 'v2';
+  api.init();
+  fire('joinProjectResponse', { publicId: 'a', project: { name: 'first' } });
+  check('a connection: the project comes with its answer', (await api.joinProject('p1')).name === 'first');
+  fire('disconnect');
+  let settled = false;
+  const pending = api.joinProject('p1').then((project) => { settled = true; return project; });
+  await sleep(100);
+  check('after a drop: the old answer is not used, as it describes an ended session', !settled);
+  fire('joinProjectResponse', { publicId: 'b', project: { name: 'second' } });
+  check('after a drop: the new connection\'s answer is', (await pending).name === 'second');
+  check('after a drop: and it stays until the next drop', (await api.joinProject('p1')).name === 'second');
 }
 
 // ---- working next to LaTeX Workshop ----
@@ -1320,6 +1777,8 @@ exports.run = async function () {
     await testReplaceDocContent(VirtualFileSystem, GlobalStateManager);
     await testComments(require(path.join(out, 'sync', 'comments.js')));
     await testSync(FolderSync);
+    await testSafety(FolderSync, merge);
+    await testConnection(require(path.join(out, 'api', 'socketio.js')).SocketIOAPI);
   } catch (e) {
     results.push(`ERROR ${e && e.stack}`);
   } finally {

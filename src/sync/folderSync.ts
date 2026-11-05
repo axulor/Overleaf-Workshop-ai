@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { minimatch } from 'minimatch';
-import { decide, decodeText, fingerprint, mergeText } from './merge';
+import { decide, decodeText, findUnsupportedCharacter, fingerprint, mergeText } from './merge';
 
 export type RemoteKind = 'doc' | 'file';
 
@@ -18,11 +18,16 @@ export interface RemoteSide {
     list(): Promise<RemoteEntry[]>;
     readDoc(path: string): Promise<string>;
     readFile(path: string): Promise<Uint8Array>;
-    /** Makes an existing document hold this text. */
-    writeDoc(path: string, text: string): Promise<void>;
+    /**
+     * Makes an existing document hold this text, provided it still holds the text the change was based on.
+     * Returns false if not: someone's edit has arrived, and sending the difference now would remove it.
+     */
+    writeDoc(path: string, text: string, basedOn: string): Promise<boolean>;
     /** Creates a file or document, or replaces a non-text file. */
     writeFile(path: string, content: Uint8Array): Promise<void>;
     remove(path: string): Promise<void>;
+    /** Keeps the file's identity, and so the comments on a document. Only within a folder, or to another folder under the same name. */
+    rename(from: string, to: string): Promise<void>;
     /** Fires a path when one file's content changed, or undefined when files may have appeared, gone or moved. */
     readonly onDidChange: vscode.Event<string | undefined>;
     readonly onDidConnect: vscode.Event<void>;
@@ -33,19 +38,30 @@ export interface FolderSyncOptions {
     /** Asks whether files deleted locally should also be deleted online. */
     confirmRemoteDelete(paths: string[]): Promise<boolean>;
     onConflict?(path: string, reason: ConflictReason): void;
+    /** A file that will not sync until someone changes it. */
+    onProblem?(path: string, problem: SyncProblem): void;
     log?(message: string): void;
     ignorePatterns?: string[];
     /** How long a path must stay quiet before it is synced. */
     debounceMs?: number;
 }
 
-export type ConflictReason = 'sameRegion' | 'bothNew' | 'deletedOnOneSide' | 'emptied' | 'notMergeable';
+export type ConflictReason = 'sameRegion' | 'bothNew' | 'deletedOnOneSide' | 'emptied' | 'notMergeable' | 'olderCopy';
+
+export type SyncProblem = { kind: 'notUtf8' } | { kind: 'unsupportedCharacter', character: string, line: number };
 
 export interface SyncStatus {
     connected: boolean;
     pending: number;
     conflicts: { path: string, reason: ConflictReason }[];
     failed: string[];
+    /** Those of the failed files that will not sync until someone changes them. */
+    refused: string[];
+}
+
+interface ReceivedEdit {
+    before: string;
+    after: string;
 }
 
 interface BaseEntry {
@@ -57,6 +73,8 @@ interface BaseEntry {
 interface Manifest {
     version: 1;
     files: { [path: string]: BaseEntry };
+    /** Files waiting for the user to choose. After a reload, nothing else would show that they must not be sent. */
+    held?: string[];
 }
 
 export const DEFAULT_IGNORE_PATTERNS = [
@@ -67,6 +85,9 @@ export const DEFAULT_IGNORE_PATTERNS = [
     // what tools leave behind while saving
     '**/*.tmp', '**/*.tmp.*', '**/*~',
 ];
+
+/** The engine's own state and what it writes, whatever the settings say. Syncing them would upload them to the project. */
+const ALWAYS_IGNORED = /^(\.overleaf|\.output|\.git)(\/|$)/;
 
 const TEXT_EXTENSIONS = new Set([
     'tex', 'latex', 'sty', 'cls', 'bst', 'bib', 'bibtex', 'txt', 'tikz', 'mtx', 'rtex', 'md', 'asy', 'lbx', 'bbx',
@@ -86,6 +107,11 @@ const DELETE_PROMPT_DELAY_MS = 500;
 const EMPTY_FILE_RECHECK_MS = 500;
 const FULL_SCAN_DELAY_MS = 300;
 const EMPTY_HASH = fingerprint('');
+/** How long the edit that arrived last is remembered, to recognize a tool writing a file it read some time ago. */
+const LAST_RECEIVED_MS = 5 * 60 * 1000;
+/** A file lacking an edit this new was being written as the edit arrived, rather than from an old copy. */
+const JUST_MISSED_MS = 1000;
+const LOCAL_WRITE_RETRIES = 100;
 
 function isFileNotFound(error: unknown) {
     return error instanceof vscode.FileSystemError && error.code === 'FileNotFound';
@@ -114,10 +140,18 @@ export class FolderSync implements vscode.Disposable {
     private readonly dirty = new Set<string>();
     private readonly failed = new Set<string>();
     private readonly conflicts = new Map<string, ConflictReason>();
-    private readonly problems = new Set<string>();
+    private readonly problems = new Map<string, string>();
     private readonly pendingDeletes = new Set<string>();
+    private readonly renaming = new Set<string>();
     private readonly emptyAcknowledged = new Set<string>();
     private readonly lastErrors = new Map<string, string>();
+    /** Files changed in the editor since they were last synced, which by that alone are based on what it showed. */
+    private readonly editedHere = new Set<string>();
+    private readonly savingForSync = new Set<string>();
+    private readonly lastReceived = new Map<string, ReceivedEdit & { at: number, previous?: ReceivedEdit }>();
+    /** Files held back as probably written from an old copy, until the user chooses. */
+    private readonly heldCopies = new Set<string>();
+    private readonly localWriteRetries = new Map<string, number>();
     private manifestChanged = false;
     private retryMs = RETRY_MS;
     private deletePromptTimer?: NodeJS.Timeout;
@@ -156,7 +190,11 @@ export class FolderSync implements vscode.Disposable {
             }),
             vscode.workspace.onDidSaveTextDocument((document) => {
                 const path = this.toPath(document.uri);
-                if (path !== undefined) { this.schedule(path); }
+                if (path !== undefined) {
+                    // A save of ours, for an edit that arrived from online, is not an edit made here.
+                    if (!this.savingForSync.has(path)) { this.editedHere.add(path); }
+                    this.schedule(path);
+                }
             }),
             this.remote.onDidChange((path) => {
                 if (path === undefined) {
@@ -201,6 +239,7 @@ export class FolderSync implements vscode.Disposable {
             pending: this.dirty.size + this.timers.size + this.saveTimers.size,
             conflicts: [...this.conflicts].map(([path, reason]) => ({ path, reason })),
             failed: [...this.failed],
+            refused: [...this.problems.keys()],
         };
     }
 
@@ -233,12 +272,29 @@ export class FolderSync implements vscode.Disposable {
         }
     }
 
-    /** Settles a conflict by choosing one side, which then spreads to the other like any other change. */
+    /**
+     * Settles a conflict by choosing one side, which then spreads to the other like any other change.
+     * Where both sides changed the same place, the choice applies only to those places.
+     */
     async resolveConflict(path: string, keep: 'local' | 'online') {
+        const reason = this.conflicts.get(path);
         const entry = await this.findRemote(path);
         const kind = entry?.kind ?? this.manifest.files[path]?.kind ?? this.guessKind(path);
         this.conflicts.delete(path);
+        this.releaseHeldCopy(path);
+        this.lastReceived.delete(path);
         this.emptyAcknowledged.add(path); // choosing a side includes choosing an empty file
+        if (keep === 'online') {
+            const discarded = await this.readLocal(path);
+            if (discarded !== undefined) { await this.writeRaw(this.discardedCopyUri(path), discarded); }
+        }
+        if (reason === 'sameRegion' && await this.resolveOverlaps(path, keep)) {
+            await this.saveManifest();
+            this.markDirty(path);
+            await this.flush();
+            this.lastReceived.delete(path);
+            return;
+        }
         if (keep === 'local') {
             if (!entry) {
                 await this.clearBase(path);
@@ -262,11 +318,30 @@ export class FolderSync implements vscode.Disposable {
         await this.saveManifest();
         this.markDirty(path);
         await this.flush();
+        // Whichever side was chosen, that settles what arrived. Bringing it over is not an edit from online either.
+        this.lastReceived.delete(path);
+    }
+
+    private async resolveOverlaps(path: string, keep: 'local' | 'online') {
+        const bytes = await this.readLocal(path);
+        const localText = bytes === undefined ? undefined : decodeText(bytes);
+        const baseText = await this.readBaseText(path);
+        if (localText === undefined || baseText === undefined) { return false; }
+        const remoteText = await this.remote.readDoc(path);
+        const merged = mergeText(baseText, localText, remoteText, keep);
+        if (!merged.ok) { return false; }
+        await this.finishMerge(path, merged.text, localText, remoteText);
+        return true;
     }
 
     /** Where the online version of a conflicted file was saved, for comparing it with the local one. */
     conflictCopyUri(path: string) {
         return vscode.Uri.joinPath(this.stateDir, 'conflicts', `${path}.online`);
+    }
+
+    /** Where the local version is kept after choosing the online one, in case that was a mistake. */
+    discardedCopyUri(path: string) {
+        return vscode.Uri.joinPath(this.stateDir, 'conflicts', `${path}.local`);
     }
 
     // ---- changes coming in ----
@@ -306,6 +381,7 @@ export class FolderSync implements vscode.Disposable {
 
     private async saveBuffer(path: string, attempt: number = 1) {
         const document = this.openDocument(path);
+        if (document?.isDirty) { this.editedHere.add(path); }
         if (document?.isDirty && !await document.save() && document.isDirty) {
             // VS Code drops a save if typing continues during it. Typing must still reach the disk in the end.
             if (attempt < SAVE_ATTEMPTS) {
@@ -412,35 +488,92 @@ export class FolderSync implements vscode.Disposable {
     // ---- syncing one file ----
 
     private async reconcile(path: string) {
-        if (this.pendingDeletes.has(path)) { return; }
+        if (this.pendingDeletes.has(path) || this.renaming.has(path)) { return; }
 
         const entry = await this.findRemote(path);
         const base = this.manifest.files[path];
+        const fromEditor = !!this.openDocument(path)?.isDirty || this.editedHere.has(path);
         const bytes = await this.readLocal(path);
+        this.editedHere.delete(path);
         if (!entry && !base && bytes === undefined) {
             this.clearConflict(path);
             return;
         }
         const kind = entry?.kind ?? base?.kind ?? this.guessKind(path);
+        if (!entry && !base && bytes !== undefined && await this.followRename(path, kind, bytes)) {
+            await this.saveManifest();
+            return;
+        }
         if (kind === 'doc') {
-            await this.reconcileDoc(path, entry, base, bytes);
+            try {
+                await this.reconcileDoc(path, entry, base, bytes, fromEditor);
+            } catch (error) {
+                if (fromEditor) { this.editedHere.add(path); }
+                throw error;
+            }
         } else {
             await this.reconcileFile(path, entry, base, bytes);
         }
         await this.saveManifest();
     }
 
-    private async reconcileDoc(path: string, entry: RemoteEntry | undefined, base: BaseEntry | undefined, bytes: Uint8Array | undefined) {
+    /**
+     * A file that appeared where another one with the same content is gone was renamed. Renaming it online keeps
+     * the document, and so its comments, which uploading a new one and deleting the old one would lose.
+     */
+    private async followRename(path: string, kind: RemoteKind, bytes: Uint8Array) {
+        const text = kind === 'doc' ? decodeText(bytes) : undefined;
+        if (kind === 'doc' && text === undefined) { return false; }
+        const hash = fingerprint(text ?? bytes);
+        if (hash === EMPTY_HASH) { return false; }
+        const nameOf = (each: string) => each.slice(each.lastIndexOf('/') + 1);
+        const folderOf = (each: string) => each.slice(0, Math.max(each.lastIndexOf('/'), 0));
+        for (const [from, known] of Object.entries(this.manifest.files)) {
+            if (known.hash !== hash || known.kind !== kind) { continue; }
+            if (folderOf(from) !== folderOf(path) && nameOf(from) !== nameOf(path)) { continue; }
+            if (await this.readLocal(from) !== undefined || !await this.findRemote(from)) { continue; }
+            // The old path looks like a deletion, and asking about that now could delete the document being renamed.
+            const wasPendingDelete = this.pendingDeletes.delete(from);
+            this.renaming.add(from);
+            try {
+                await this.remote.rename(from, path);
+            } catch (error) {
+                this.report(`Could not rename ${from} online: ${error}`);
+                if (wasPendingDelete) { this.askToDeleteRemote(from); }
+                return false;
+            } finally {
+                this.renaming.delete(from);
+            }
+            this.clearConflict(from);
+            await this.clearBase(from);
+            await this.setBase(path, kind, hash, text, (await this.findRemote(path))?.version);
+            this.report(`Renamed ${from} to ${path}`);
+            return true;
+        }
+        return false;
+    }
+
+    /** A file that cannot be synced until someone changes it: it shows as failed, and the user is told once. */
+    private refuse(path: string, problem: SyncProblem, message: string): never {
+        const key = JSON.stringify(problem);
+        if (this.problems.get(path) !== key) {
+            this.problems.set(path, key);
+            this.options.onProblem?.(path, problem);
+        }
+        throw new Error(message);
+    }
+
+    private async reconcileDoc(path: string, entry: RemoteEntry | undefined, base: BaseEntry | undefined, bytes: Uint8Array | undefined, fromEditor: boolean) {
         let localText: string | undefined;
         if (bytes !== undefined) {
             localText = decodeText(bytes);
             if (localText === undefined) {
-                // Decoding it would corrupt the online copy, so it stays out of sync until someone fixes it.
-                if (!this.problems.has(path)) {
-                    this.problems.add(path);
-                    this.report(`${path} is not valid UTF-8, so it is not synced.`);
-                }
-                return;
+                // Decoding it would corrupt the online copy.
+                this.refuse(path, { kind: 'notUtf8' }, 'it is not valid UTF-8');
+            }
+            const unsupported = findUnsupportedCharacter(localText);
+            if (unsupported) {
+                this.refuse(path, { kind: 'unsupportedCharacter', ...unsupported }, `line ${unsupported.line} has a character Overleaf cannot hold`);
             }
             this.problems.delete(path);
         }
@@ -450,6 +583,14 @@ export class FolderSync implements vscode.Disposable {
         const remoteHash = remoteText === undefined ? undefined : fingerprint(remoteText);
 
         const decision = decide(baseHash, localHash, remoteHash);
+        if (this.heldCopies.has(path)) {
+            // Held until the user chooses, whatever else happens to the file.
+            if (decision !== 'none') {
+                if (!this.conflicts.has(path)) { await this.markConflict(path, 'olderCopy', remoteText); }
+                return;
+            }
+            this.releaseHeldCopy(path);
+        }
         if (decision === 'none') {
             this.clearConflict(path);
             if (localText === undefined) {
@@ -480,19 +621,31 @@ export class FolderSync implements vscode.Disposable {
 
         switch (decision) {
             case 'pull':
-                await this.writeLocalText(path, remoteText!);
+                if (!await this.writeLocalText(path, remoteText!, localText)) {
+                    this.retryAfterLocalChange(path);
+                    return;
+                }
+                if (localText !== undefined) { this.rememberReceived(path, localText, remoteText!); }
                 await this.settleDoc(path, remoteText!);
                 this.report(`Received ${path}`);
                 break;
-            case 'push':
-                if (entry) {
-                    await this.remote.writeDoc(path, localText!);
-                } else {
+            case 'push': {
+                if (!entry) {
                     await this.remote.writeFile(path, new TextEncoder().encode(localText!));
+                } else {
+                    if (!fromEditor && this.lacksWhatArrived(path, localText!)) {
+                        await this.handleMissingEdit(path, localText!, remoteText!);
+                        return;
+                    }
+                    if (!await this.remote.writeDoc(path, localText!, remoteText!)) {
+                        this.markDirty(path); // someone's edit has arrived, and the next pass merges it
+                        return;
+                    }
                 }
                 await this.settleDoc(path, localText!);
                 this.report(`Sent ${path}`);
                 break;
+            }
             case 'deleteLocal':
                 await this.moveLocalToTrash(path);
                 await this.clearBase(path);
@@ -502,13 +655,15 @@ export class FolderSync implements vscode.Disposable {
                 this.askToDeleteRemote(path);
                 break;
             case 'merge': {
+                if (!fromEditor && this.lacksWhatArrived(path, localText!)) {
+                    await this.handleMissingEdit(path, localText!, remoteText!);
+                    return;
+                }
                 const baseText = await this.readBaseText(path);
                 const merged = baseText === undefined ? undefined : mergeText(baseText, localText!, remoteText!);
                 if (merged?.ok) {
-                    if (merged.text !== localText) { await this.writeLocalText(path, merged.text); }
-                    if (merged.text !== remoteText) { await this.remote.writeDoc(path, merged.text); }
-                    await this.settleDoc(path, merged.text);
-                    this.report(`Merged ${path}`);
+                    await this.finishMerge(path, merged.text, localText!, remoteText!);
+                    if (fingerprint(baseText!) !== fingerprint(remoteText!)) { this.rememberReceived(path, baseText!, remoteText!); }
                 } else {
                     await this.markConflict(path, 'sameRegion', remoteText);
                 }
@@ -520,7 +675,90 @@ export class FolderSync implements vscode.Disposable {
         }
     }
 
+    /**
+     * Brings merged text to both sides. The local side comes first. From then on it descends from what was read
+     * online, which becomes the base, so if someone's next edit has arrived by the time of sending, the next pass
+     * merges it from there, and a collaborator who keeps typing causes no false conflict.
+     */
+    private async finishMerge(path: string, merged: string, localText: string, remoteText: string) {
+        if (merged !== localText && !await this.writeLocalText(path, merged, localText)) {
+            this.retryAfterLocalChange(path);
+            return;
+        }
+        await this.setBase(path, 'doc', fingerprint(remoteText), remoteText, (await this.findRemote(path))?.version);
+        if (merged !== remoteText && !await this.remote.writeDoc(path, merged, remoteText)) {
+            this.markDirty(path);
+            return;
+        }
+        await this.settleDoc(path, merged);
+        this.report(`Merged ${path}`);
+    }
+
+    /**
+     * A tool may write a whole file that it read some time ago. It looks like a local change to the latest version,
+     * and sending it would remove what arrived since. What shows it is that the file lacks the edit that arrived
+     * last. Trying to tell a stale copy from a deliberate edit, or to merge it, goes wrong in too many ways to do
+     * silently with someone else's words, so the file is held and the user decides.
+     */
+    private lacksWhatArrived(path: string, text: string) {
+        const change = this.lastReceived.get(path);
+        return !!change && Date.now() - change.at < LAST_RECEIVED_MS && this.lacks(change, text);
+    }
+
+    private lacks(change: ReceivedEdit, text: string) {
+        const merged = mergeText(change.before, text, change.after);
+        return !merged.ok || merged.text !== text;
+    }
+
+    private rememberReceived(path: string, before: string, after: string) {
+        const previous = this.lastReceived.get(path);
+        this.lastReceived.set(path, { before, after, at: Date.now(), previous: previous && { before: previous.before, after: previous.after } });
+    }
+
+    /**
+     * Holds the file, except where a tool read it at the very moment an edit arrived. Such a file has the edit before
+     * that one and lacks only one that is moments old, and merging it from just before that edit loses nothing. Asking
+     * the user to give up one side would be wrong there. An old copy lacks the earlier edit too.
+     */
+    private async handleMissingEdit(path: string, localText: string, remoteText: string) {
+        const change = this.lastReceived.get(path)!;
+        if (Date.now() - change.at < JUST_MISSED_MS && !(change.previous && this.lacks(change.previous, localText))) {
+            const merged = mergeText(change.before, localText, remoteText);
+            if (merged.ok) {
+                this.report(`${path} was written as an edit arrived, and has both now.`);
+                await this.finishMerge(path, merged.text, localText, remoteText);
+                return;
+            }
+        }
+        await this.holdOlderCopy(path, remoteText);
+    }
+
+    /** The local text changed while working on it, so this needs deciding again. An editor that never takes it must show. */
+    private retryAfterLocalChange(path: string) {
+        const tries = (this.localWriteRetries.get(path) ?? 0) + 1;
+        if (tries > LOCAL_WRITE_RETRIES) {
+            this.localWriteRetries.delete(path);
+            throw new Error('the editor does not accept the update');
+        }
+        this.localWriteRetries.set(path, tries);
+        this.schedule(path);
+    }
+
+    private async holdOlderCopy(path: string, remoteText: string) {
+        this.report(`${path} lacks the edit that arrived last, so it is held until a choice is made.`);
+        this.heldCopies.add(path);
+        this.manifestChanged = true;
+        await this.markConflict(path, 'olderCopy', remoteText);
+    }
+
+    private releaseHeldCopy(path: string) {
+        if (this.heldCopies.delete(path)) { this.manifestChanged = true; }
+    }
+
     private async settleDoc(path: string, text: string) {
+        // Text agreed on without what arrived last means it was removed on purpose, and later versions need not have it.
+        if (this.lacksWhatArrived(path, text)) { this.lastReceived.delete(path); }
+        this.localWriteRetries.delete(path);
         this.emptyAcknowledged.delete(path);
         this.clearConflict(path);
         await this.setBase(path, 'doc', fingerprint(text), text, (await this.findRemote(path))?.version);
@@ -604,7 +842,14 @@ export class FolderSync implements vscode.Disposable {
         // Deleting a folder deletes many files at once, and they should share one question.
         this.deletePromptTimer = setTimeout(async () => {
             this.deletePromptTimer = undefined;
+            // Renaming a folder arrives file by file, and what is still queued may turn out to be renames.
+            if (this.loop || this.dirty.size > 0 || this.timers.size > 0) {
+                const next = this.pendingDeletes.values().next().value;
+                if (next !== undefined) { this.askToDeleteRemote(next); }
+                return;
+            }
             const paths = [...this.pendingDeletes];
+            if (paths.length === 0) { return; } // they all turned out to be renames
             const confirmed = await this.options.confirmRemoteDelete(paths);
             for (const each of paths) {
                 this.pendingDeletes.delete(each);
@@ -652,23 +897,44 @@ export class FolderSync implements vscode.Disposable {
         }
     }
 
-    private async writeLocalText(path: string, text: string) {
+    /**
+     * Writes the text, unless the local text is no longer what the change was based on. Then it returns false.
+     * A file open in the editor changes there and not on the disk: VS Code takes a moment to reload a file, and
+     * typing in that moment would be on the old text, which would then look like a change that removes the new one.
+     */
+    private async writeLocalText(path: string, text: string, basedOn: string | undefined) {
         const document = this.openDocument(path);
-        if (document?.isDirty) {
-            await this.applyToBuffer(document, text);
-            return;
+        if (document && basedOn !== undefined) {
+            return document.getText().replace(/\r\n/g, '\n') === basedOn && await this.applyToBuffer(document, text);
         }
-        // A file with Windows line endings keeps them, so that syncing does not touch every line of it.
+        // The folder comes first, to leave as little time as possible between checking the file and writing it.
+        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.toUri(path), '..'));
         const existing = await this.readLocal(path);
+        if ((existing === undefined ? undefined : decodeText(existing)) !== basedOn) { return false; }
+        // A file with Windows line endings keeps them, so that syncing does not touch every line of it.
         const usesCrlf = existing !== undefined && new TextDecoder().decode(existing).includes('\r\n');
-        await this.writeLocalBytes(path, new TextEncoder().encode(usesCrlf ? text.replace(/\n/g, '\r\n') : text));
+        await vscode.workspace.fs.writeFile(this.toUri(path), new TextEncoder().encode(usesCrlf ? text.replace(/\n/g, '\r\n') : text));
+        return true;
     }
 
     /** Applies a change to an editor with unsaved typing, touching only what differs so the cursor stays put. */
     private async applyToBuffer(document: vscode.TextDocument, text: string) {
-        const target = document.eol === vscode.EndOfLine.CRLF ? text.replace(/\n/g, '\r\n') : text;
+        // Worked out on \n line endings, whatever the file uses. VS Code writes them as the file does, and a
+        // difference worked out on \r\n could start between the two, which adds a line break.
+        const current = document.getText().replace(/\r\n/g, '\n');
+        const lineStarts = [0];
+        for (let at = current.indexOf('\n'); at >= 0; at = current.indexOf('\n', at + 1)) { lineStarts.push(at + 1); }
+        const positionAt = (offset: number) => {
+            let low = 0;
+            let high = lineStarts.length - 1;
+            while (low < high) {
+                const middle = Math.ceil((low + high) / 2);
+                if (lineStarts[middle] <= offset) { low = middle; } else { high = middle - 1; }
+            }
+            return new vscode.Position(low, offset - lineStarts[low]);
+        };
         const dmp = new DiffMatchPatch();
-        const diffs = dmp.diff_main(document.getText(), target);
+        const diffs = dmp.diff_main(current, text);
         dmp.diff_cleanupSemantic(diffs);
 
         const edit = new vscode.WorkspaceEdit();
@@ -677,16 +943,22 @@ export class FolderSync implements vscode.Disposable {
             if (operation === 0) {
                 offset += part.length;
             } else if (operation === -1) {
-                edit.delete(document.uri, new vscode.Range(document.positionAt(offset), document.positionAt(offset + part.length)));
+                edit.delete(document.uri, new vscode.Range(positionAt(offset), positionAt(offset + part.length)));
                 offset += part.length;
             } else {
-                edit.insert(document.uri, document.positionAt(offset), part);
+                edit.insert(document.uri, positionAt(offset), part);
             }
         }
-        if (!await vscode.workspace.applyEdit(edit)) {
-            throw new Error(`The editor refused an update to ${document.fileName}.`);
+        // VS Code refuses this if the text changed since the positions were worked out, so no typing is overwritten.
+        if (!await vscode.workspace.applyEdit(edit)) { return false; }
+        const path = this.toPath(document.uri);
+        if (path !== undefined) { this.savingForSync.add(path); }
+        try {
+            await document.save();
+        } finally {
+            if (path !== undefined) { this.savingForSync.delete(path); }
         }
-        await document.save();
+        return true;
     }
 
     private async writeLocalBytes(path: string, content: Uint8Array) {
@@ -738,7 +1010,7 @@ export class FolderSync implements vscode.Disposable {
     }
 
     private isIgnored(path: string) {
-        return this.ignorePatterns.some((pattern) => minimatch(path, pattern, { dot: true }));
+        return ALWAYS_IGNORED.test(path) || this.ignorePatterns.some((pattern) => minimatch(path, pattern, { dot: true }));
     }
 
     private guessKind(path: string): RemoteKind {
@@ -790,6 +1062,7 @@ export class FolderSync implements vscode.Disposable {
                 const parsed = JSON.parse(new TextDecoder().decode(await vscode.workspace.fs.readFile(this.manifestUri)));
                 if (parsed?.version === 1 && typeof parsed.files === 'object') {
                     this.manifest = parsed;
+                    (parsed.held ?? []).forEach((path: string) => this.heldCopies.add(path));
                     return;
                 }
                 throw new Error('unexpected content');
@@ -808,6 +1081,7 @@ export class FolderSync implements vscode.Disposable {
 
     private async saveManifest() {
         if (!this.manifestChanged) { return; }
+        this.manifest.held = [...this.heldCopies];
         const temporary = vscode.Uri.joinPath(this.stateDir, 'manifest.json.saving');
         await vscode.workspace.fs.writeFile(temporary, new TextEncoder().encode(JSON.stringify(this.manifest, null, 1)));
         await vscode.workspace.fs.rename(temporary, this.manifestUri, { overwrite: true });

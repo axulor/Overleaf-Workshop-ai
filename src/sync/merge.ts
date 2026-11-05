@@ -37,6 +37,16 @@ export function decodeText(bytes: Uint8Array): string | undefined {
     }
 }
 
+/**
+ * The first character Overleaf cannot hold, if any: one outside the Basic Multilingual Plane, such as an emoji.
+ * Sending one makes the server drop the connection and lose the whole edit.
+ */
+export function findUnsupportedCharacter(text: string) {
+    const at = text.search(/[\uD800-\uDFFF]/);
+    if (at < 0) { return undefined; }
+    return { character: String.fromCodePoint(text.codePointAt(at)!), line: text.slice(0, at).split('\n').length };
+}
+
 export type MergeResult = { ok: true, text: string } | { ok: false, conflicts: number };
 
 interface Edit {
@@ -76,8 +86,11 @@ function editsBetween(base: string, changed: string): Edit[] {
  * Combines two sets of changes to the same text. Changes merge only if they neither overlap nor touch,
  * so a clean merge never has to guess: a paragraph in which both sides edited different sentences merges,
  * and anything closer than that is reported as a conflict.
+ *
+ * With a preferred side there are no conflicts: where changes overlap that side's are taken, and changes
+ * elsewhere on both sides stay.
  */
-export function mergeText(base: string, local: string, remote: string): MergeResult {
+export function mergeText(base: string, local: string, remote: string, prefer?: 'local' | 'online'): MergeResult {
     if (local === remote) { return { ok: true, text: local }; }
 
     const ours = editsBetween(base, local);
@@ -92,11 +105,32 @@ export function mergeText(base: string, local: string, remote: string): MergeRes
         if (a && b && a.start <= b.end && b.start <= a.end) {
             if (a.start === b.start && a.end === b.end && a.text === b.text) {
                 merged.push(a);
+                i++;
+                j++;
+            } else if (prefer) {
+                // Edits that overlap one another are decided together, from one side.
+                let end = Math.max(a.end, b.end);
+                let nextOurs = i + 1;
+                let nextTheirs = j + 1;
+                for (let grew = true; grew;) {
+                    grew = false;
+                    if (ours[nextOurs] && ours[nextOurs].start <= end) {
+                        end = Math.max(end, ours[nextOurs++].end);
+                        grew = true;
+                    }
+                    if (theirs[nextTheirs] && theirs[nextTheirs].start <= end) {
+                        end = Math.max(end, theirs[nextTheirs++].end);
+                        grew = true;
+                    }
+                }
+                merged.push(...(prefer === 'local' ? ours.slice(i, nextOurs) : theirs.slice(j, nextTheirs)));
+                i = nextOurs;
+                j = nextTheirs;
             } else {
                 conflicts++;
+                i++;
+                j++;
             }
-            i++;
-            j++;
         } else if (a && (!b || a.end < b.start)) {
             merged.push(a);
             i++;

@@ -47,6 +47,8 @@ export class VfsRemoteSide implements RemoteSide, CommentSource, vscode.Disposab
             const path = event.uri.path.slice(prefix.length);
             if (path === OUTPUT_FOLDER_NAME || path.startsWith(`${OUTPUT_FOLDER_NAME}/`)) { continue; }
             this.changeEmitter.fire(event.type === vscode.FileChangeType.Changed ? path : undefined);
+            // A comment's document may have been renamed, moved or deleted.
+            if (event.type !== vscode.FileChangeType.Changed) { this.commentsEmitter.fire(); }
         }
     }
 
@@ -67,7 +69,8 @@ export class VfsRemoteSide implements RemoteSide, CommentSource, vscode.Disposab
     }
 
     async readDoc(path: string) {
-        return new TextDecoder().decode(await this.vfs.openFile(this.uri(path)));
+        // Exactly what the document holds, as a write states the text it was based on. By default this would drop a byte order mark.
+        return new TextDecoder('utf-8', { ignoreBOM: true }).decode(await this.vfs.openFile(this.uri(path)));
     }
 
     async readFile(path: string) {
@@ -78,8 +81,16 @@ export class VfsRemoteSide implements RemoteSide, CommentSource, vscode.Disposab
         return content;
     }
 
-    async writeDoc(path: string, text: string) {
-        await this.vfs.replaceDocContent(this.uri(path), text);
+    async writeDoc(path: string, text: string, basedOn: string) {
+        return this.vfs.replaceDocContent(this.uri(path), text, basedOn);
+    }
+
+    async rename(from: string, to: string) {
+        await this.ensureFolder(to);
+        await this.vfs.rename(this.uri(from), this.uri(to), false);
+        if (!(await this.list()).some((entry) => entry.path === to)) {
+            throw new Error(`Overleaf did not rename ${from}.`);
+        }
     }
 
     async writeFile(path: string, content: Uint8Array) {
