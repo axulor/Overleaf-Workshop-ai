@@ -7,6 +7,7 @@ import { PdfViewEditorProvider } from './core/pdfViewEditorProvider';
 import { CompileManager } from './compile/compileManager';
 import { LangIntellisenseProvider } from './intellisense';
 import { LocalReplicaSCMProvider } from './scm/localReplicaSCM';
+import { FolderSyncManager } from './sync';
 
 export function activate(context: vscode.ExtensionContext) {
     // Register: [core] RemoteFileSystemProvider
@@ -28,6 +29,11 @@ export function activate(context: vscode.ExtensionContext) {
     // Register: [intellisense] LangIntellisenseProvider
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
+
+    // Register: [sync] FolderSyncManager on Statusbar
+    const folderSyncManager = new FolderSyncManager(remoteFileSystemProvider);
+    context.subscriptions.push( ...folderSyncManager.triggers );
+    folderSyncManager.resume();
 
     // activate vfs for local replica
     LocalReplicaSCMProvider.readSettings()

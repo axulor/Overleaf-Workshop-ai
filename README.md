@@ -2,7 +2,29 @@
 
 An unofficial fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop) by iamhyc and contributors, under the same AGPL-3.0 license. It is not affiliated with Overleaf or with the original project, and it cannot run alongside the original extension: disable that one first.
 
-The goal is to work on an Overleaf project from a real local folder, with AI coding assistants editing the files directly and changes reaching Overleaf in real time. That work is in progress. So far this fork changes how compiling works:
+The goal is to work on an Overleaf project from a real local folder, with AI coding assistants editing the files directly and changes reaching Overleaf in real time. That work is in progress.
+
+### Syncing a project to a local folder
+
+The original extension opens a project in a virtual folder, which tools that work on real files cannot reach. Here, the project lives in a real folder:
+
+```
+my-paper/                    open this folder in VS Code
+├─ overleaf-<project name>/  the Overleaf project, kept in step in both directions
+├─ zh/, data/, code/, ...    anything else stays local
+```
+
+Open your paper's folder, hover over a project in the Overleaf panel and click the cloud icon (`同步到本地`).
+
+- Any change to a file reaches Overleaf about a second later, whichever tool made it. Typing in VS Code does too, without saving.
+- Changes are sent as real-time edits of the difference, not by replacing files, so collaborators' comments stay in place.
+- Online changes arrive in the folder as they happen, including into a file open with unsaved typing.
+- If both sides changed the same place, nothing is overwritten: both versions are kept and you choose one. Different sentences of one paragraph merge by themselves.
+- Files deleted locally are only deleted online after you confirm. Files deleted online are moved to `.overleaf/sync/trash/` in the project folder.
+- Compile results are copied to `.output/` in the project folder. A compile first sends all pending changes.
+- Changes made while VS Code is closed or offline are merged when it reconnects.
+
+### Compiling
 
 - A PDF with LaTeX errors in its log no longer shows as a failed compile. As on Overleaf's own page, the PDF is available and the errors are listed in the Problems panel.
 - A manual compile opens the PDF beside the editor.

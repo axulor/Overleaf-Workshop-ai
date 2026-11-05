@@ -61,7 +61,8 @@
   ],
   "activationEvents": [
     "onFileSystem:overleaf-workshop",
-    "workspaceContains:.overleaf/settings.json"
+    "workspaceContains:.overleaf/settings.json",
+    "workspaceContains:*/.overleaf/settings.json"
   ],
   "main": "./out/extension.js",
   "l10n": "./l10n",
@@ -271,6 +272,18 @@
         "title": "%commands.projectManager.openProjectLocalReplica.title%",
         "icon": "$(file-directory)",
         "enablement": "viewItem == project || viewItem == project_in_tag",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.linkProject",
+        "title": "同步到本地",
+        "icon": "$(cloud)",
+        "enablement": "viewItem == project || viewItem == project_in_tag",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.showStatus",
+        "title": "查看同步状态",
         "category": "%extension.displayName%"
       },
       {
@@ -711,6 +724,11 @@
           "group": "1_editActions"
         },
         {
+          "command": "overleaf-workshop.sync.linkProject",
+          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "group": "inline@0"
+        },
+        {
           "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
           "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "inline@3"
@@ -734,6 +752,11 @@
           "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
           "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "1_openActions@3"
+        },
+        {
+          "command": "overleaf-workshop.sync.linkProject",
+          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "group": "1_openActions@0"
         },
         {
           "command": "overleaf-workshop.projectHistory.createLabel",

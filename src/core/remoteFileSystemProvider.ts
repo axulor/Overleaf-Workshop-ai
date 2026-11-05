@@ -34,6 +34,9 @@ export interface DocumentEntity extends FileEntity {
     lastVersion?: number,
     localCache?: string,
     remoteCache?: string,
+    /** An update of ours is on its way to the server, and someone else's arrived meanwhile. */
+    sendingUpdate?: boolean,
+    changedWhileSending?: boolean,
 }
 
 export interface FileRefEntity extends FileEntity {
@@ -301,8 +304,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                         triggers: scmCollection.triggers,
                     };
                 }
-                // trigger the first compile
-                vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+                // Every join starts without output files, and this one is not a request to see the PDF.
+                this.isDirty = true;
+                vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compileQuietly`);
+                EventBus.fire('projectJoinedEvent', {projectId: this.projectId});
                 return project;
             }).catch((err) => {
                 this.retryConnection += 1;
@@ -451,6 +456,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             onDisconnected: () => {
                 if (this.root===undefined) { return; } // bypass the first initialization
                 console.log("Disconnected");
+                EventBus.fire('projectDisconnectedEvent', {projectId: this.projectId});
                 // Debounce: ignore rapid disconnect/reconnect cycles (within 2 seconds)
                 const now = Date.now();
                 if (now - this.lastDisconnectTime < 2000) {
@@ -531,6 +537,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const doc = res.fileEntity as DocumentEntity;
                 if (update.v===doc.version) {
                     doc.version += 1;
+                    if (update.op && doc.sendingUpdate) {
+                        doc.changedWhileSending = true;
+                    }
                     if (update.op && doc.remoteCache!==undefined) {
                         let content = doc.remoteCache;
                         update.op.forEach((op) => {
@@ -552,8 +561,15 @@ export class VirtualFileSystem extends vscode.Disposable {
                         ]);
                     }
                 } else {
+                    // Out of step with the server: the next read joins the document again to catch up.
                     doc.remoteCache = undefined;
                     doc.localCache = undefined;
+                    if (doc.sendingUpdate) {
+                        doc.changedWhileSending = true;
+                    }
+                    this.notify([
+                        {type: vscode.FileChangeType.Changed, uri: this.pathToUri(res.path)}
+                    ]);
                 }
             },
             onSpellCheckLanguageUpdated: (language:string) => {
@@ -898,6 +914,73 @@ export class VirtualFileSystem extends vscode.Disposable {
                 ]);
             }, 10);
             doc.lastVersion = doc.version;                
+        }
+    }
+
+    /**
+     * Makes a document hold exactly this text by sending the difference as a real-time edit.
+     * Unlike writeFile it does not merge anything itself: a folder sync has already worked out
+     * the content, and merging again could apply someone else's change a second time.
+     */
+    async replaceDocContent(uri: vscode.Uri, text: string) {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (fileType!=='doc' || !fileEntity) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        const doc = fileEntity as DocumentEntity;
+        if (doc.version===undefined || doc.remoteCache===undefined) {
+            await this.openFile(uri);
+        }
+        const current = doc.remoteCache!;
+        if (current===text) { return; } // the server drops the connection over an empty update
+
+        // Each operation applies to the result of the one before it, so a deletion does not move the position.
+        const op: NonNullable<UpdateSchema['op']> = [];
+        let position = 0;
+        for (const [operation, part] of new DiffMatchPatch().diff_main(current, text)) {
+            if (operation===-1) {
+                op.push({p: position, d: part});
+            } else {
+                if (operation===1) { op.push({p: position, i: part}); }
+                position += part.length;
+            }
+        }
+        const update: UpdateSchema = {
+            doc: doc._id,
+            lastV: doc.lastVersion,
+            v: doc.version!,
+            op,
+        };
+        // Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288
+        if (!doc.mtime || Date.now()-doc.mtime>5000) {
+            doc.mtime = Date.now();
+            update.hash = require('crypto').createHash('sha1').update("blob " + text.length + "\x00" + text).digest('hex');
+        }
+
+        doc.sendingUpdate = true;
+        doc.changedWhileSending = false;
+        try {
+            await this.socket.applyOtUpdate(doc._id, update);
+        } catch (error) {
+            // It may or may not have been applied, so the only trustworthy version is the server's.
+            doc.remoteCache = undefined;
+            doc.localCache = undefined;
+            throw error;
+        } finally {
+            doc.sendingUpdate = false;
+        }
+
+        this.isDirty = true;
+        doc.lastVersion = doc.version;
+        if (doc.changedWhileSending) {
+            // Someone else's edit arrived while ours was on its way, so the server holds both, and neither
+            // this text nor the cache is what it has. Catch up by joining the document again.
+            doc.remoteCache = undefined;
+            doc.localCache = undefined;
+            this.notify([{type: vscode.FileChangeType.Changed, uri}]);
+        } else {
+            doc.remoteCache = text;
+            doc.localCache = text;
         }
     }
 

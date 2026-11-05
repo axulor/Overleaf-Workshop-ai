@@ -5,6 +5,7 @@ import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
+const PROJECT_ROOT_CACHE_MS = 5000;
 
 type FileCache = {date:number, hash:number};
 
@@ -71,7 +72,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         super(vfs, baseUri);
     }
 
-    private static sanitizeProjectFolderName(projectName: string): string {
+    public static sanitizeProjectFolderName(projectName: string): string {
         let sanitized = projectName;
         if (process.platform==='win32') {
             sanitized = projectName
@@ -116,14 +117,61 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    /**
+     * The folder directly inside `parent` that holds a linked project, found by its settings file,
+     * so that the folder can be renamed freely.
+     */
+    public static async findProjectFolder(parent: vscode.Uri): Promise<vscode.Uri | undefined> {
+        let entries: [string, vscode.FileType][];
+        try {
+            entries = await vscode.workspace.fs.readDirectory(parent);
+        } catch (error) {
+            return undefined;
+        }
+        const folders = entries
+            .filter(([name, type]) => (type & vscode.FileType.Directory) && !name.startsWith('.'))
+            .map(([name]) => name)
+            .sort();
+        for (const name of folders) {
+            const folder = vscode.Uri.joinPath(parent, name);
+            try {
+                await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder, '.overleaf/settings.json'));
+                return folder;
+            } catch (error) {
+                // not this one
+            }
+        }
+        return undefined;
+    }
+
+    private static projectRootCache?: {workspaceRoot: string, projectRoot: vscode.Uri, time: number};
+
+    /** Call after linking a project, so that the next lookup sees it. */
+    public static forgetProjectRoot() {
+        LocalReplicaSCMProvider.projectRootCache = undefined;
+    }
+
+    /** The folder holding the project: a linked folder inside the open folder if there is one, otherwise the open folder. */
+    private static async projectRoot(workspaceRoot: vscode.Uri): Promise<vscode.Uri> {
+        // Cursor moves come through here, and this looks through every folder in the workspace root.
+        const cache = LocalReplicaSCMProvider.projectRootCache;
+        if (cache?.workspaceRoot===workspaceRoot.toString() && Date.now()-cache.time<PROJECT_ROOT_CACHE_MS) {
+            return cache.projectRoot;
+        }
+        const projectRoot = await LocalReplicaSCMProvider.findProjectFolder(workspaceRoot) ?? workspaceRoot;
+        LocalReplicaSCMProvider.projectRootCache = {workspaceRoot: workspaceRoot.toString(), projectRoot, time: Date.now()};
+        return projectRoot;
+    }
+
     public static async pathToUri(path: string): Promise<vscode.Uri | undefined> {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, '.overleaf/settings.json');
+        const projectRoot = await LocalReplicaSCMProvider.projectRoot(workspaceRoot);
+        const settingUri = vscode.Uri.joinPath(projectRoot, '.overleaf/settings.json');
         try {
             await vscode.workspace.fs.stat(settingUri);
-            return vscode.Uri.joinPath(workspaceRoot, path);
+            return vscode.Uri.joinPath(projectRoot, path);
         } catch (error) {
             return undefined;
         }
@@ -133,10 +181,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, '.overleaf/settings.json');
+        const projectRoot = await LocalReplicaSCMProvider.projectRoot(workspaceRoot);
+        const settingUri = vscode.Uri.joinPath(projectRoot, '.overleaf/settings.json');
         try {
             await vscode.workspace.fs.stat(settingUri);
-            return uri.path.slice(workspaceRoot.path.length);
+            // A file next to the project, such as the Chinese manuscript, is not part of it.
+            // Case does not count on Windows, where one drive letter can appear as both D: and d:.
+            if (!uri.path.toLowerCase().startsWith(`${projectRoot.path.toLowerCase()}/`)) { return undefined; }
+            return uri.path.slice(projectRoot.path.length);
         } catch (error) {
             return undefined;
         }
@@ -146,7 +198,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
         if (vscode.workspace.workspaceFolders?.length!==1 || workspaceRoot?.scheme!=='file') { return undefined; }
 
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, '.overleaf/settings.json');
+        const projectRoot = await LocalReplicaSCMProvider.projectRoot(workspaceRoot);
+        const settingUri = vscode.Uri.joinPath(projectRoot, '.overleaf/settings.json');
         try {
             await vscode.workspace.fs.stat(settingUri);
             const content = await vscode.workspace.fs.readFile(settingUri);

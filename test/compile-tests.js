@@ -238,6 +238,34 @@ async function testManager(CompileManager) {
   await sleep(100);
   check('a failed log download does not fail the compile', !manager.status.text.includes('$(x)') && seen.opened.length === 1, manager.status.text);
 
+  // a folder sync sends its changes before a compile and keeps a copy of the results after it
+  const order = [];
+  vfs = makeVfs(() => { order.push('compile'); return outcome('success', { hasLog: true, hasPdf: true }); }, { fileType: 'folder' }, 'clean log\n');
+  manager = managerFor(vfs);
+  watched(manager);
+  CompileManager.beforeCompile = async () => { order.push('flush'); };
+  CompileManager.afterCompile = async (_, finished) => { order.push(`saved ${finished.status}`); };
+  await manager.compile(true);
+  check('pending changes are sent before compiling', order.join() === 'flush,compile,saved success', order.join());
+
+  CompileManager.beforeCompile = async () => { throw new Error('offline'); };
+  vfs = makeVfs(() => outcome('success'));
+  manager = managerFor(vfs);
+  await manager.compile(true);
+  check('if they cannot be sent, stale text is not compiled', vfs.calls.compile.length === 0);
+  check('and compiling is not stuck', manager.inCompiling === false);
+
+  CompileManager.beforeCompile = undefined;
+  CompileManager.afterCompile = async () => { throw new Error('disk full'); };
+  vfs = makeVfs(() => outcome('success', { hasLog: true, hasPdf: true }), { fileType: 'folder' }, 'clean log\n');
+  manager = managerFor(vfs);
+  seen = watched(manager);
+  await manager.compile(true);
+  await sleep(100);
+  check('failing to keep a local copy does not fail the compile', !manager.status.text.includes('$(x)') && seen.opened.length === 1, manager.status.text);
+  check('but is recorded', seen.record.some((l) => l.includes('disk full')), JSON.stringify(seen.record));
+  CompileManager.afterCompile = undefined;
+
   vfs = makeVfs(() => outcome('request-failed', { message: '500: boom' }));
   manager = managerFor(vfs);
   await manager.compile(true);

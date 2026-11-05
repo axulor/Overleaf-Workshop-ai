@@ -11,6 +11,8 @@ export type Events = {
     'rootDocUpdateEvent': {rootDocId:string},
     'scmStatusChangeEvent': {status:StatusInfo},
     'socketioConnectedEvent': {publicId:string},
+    'projectJoinedEvent': {projectId:string},
+    'projectDisconnectedEvent': {projectId:string},
 };
 
 export class EventBus {

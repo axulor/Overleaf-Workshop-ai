@@ -1,7 +1,7 @@
 # Opens a separate VS Code with this build, for trying it against a real Overleaf account.
 # It has its own profile, so your own VS Code, its extensions and the official Overleaf Workshop are not touched.
 # Its login and logs stay in the profile folder below, outside the repository.
-param([string]$ExtensionDir = (Split-Path -Parent $PSScriptRoot))
+param([string]$Folder = '', [string]$ExtensionDir = (Split-Path -Parent $PSScriptRoot))
 
 $profileDir = Join-Path $env:LOCALAPPDATA 'overleaf-workshop-ai-dev'
 New-Item -ItemType Directory -Force -Path (Join-Path $profileDir 'user-data'), (Join-Path $profileDir 'extensions') | Out-Null
@@ -16,5 +16,6 @@ $arguments = @(
   "--user-data-dir=`"$profileDir\user-data`"", "--extensions-dir=`"$profileDir\extensions`"",
   "--extensionDevelopmentPath=`"$ExtensionDir`"", '--skip-welcome', '--skip-release-notes', '--new-window'
 )
+if ($Folder) { $arguments += "`"$Folder`"" }
 Start-Process -FilePath $exe -ArgumentList $arguments | Out-Null
-"Opened. Compile records are written under $profileDir\user-data\logs"
+"Opened. Records are written under $profileDir\user-data\logs"

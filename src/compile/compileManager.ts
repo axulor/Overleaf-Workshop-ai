@@ -151,6 +151,10 @@ class CompileDiagnosticProvider {
 }
 
 export class CompileManager {
+    /** Run by a folder sync, to send pending changes first and to keep a local copy of the results. */
+    static beforeCompile?: () => Promise<void>;
+    static afterCompile?: (vfs: VirtualFileSystem, outcome: CompileOutcome) => Promise<void>;
+
     readonly status: vscode.StatusBarItem;
     public inCompiling: boolean = false;
     private diagnosticProvider: CompileDiagnosticProvider;
@@ -246,6 +250,7 @@ export class CompileManager {
         if (!uri) { return; }
 
         try {
+            await CompileManager.beforeCompile?.();
             const vfs = await this.vfsm.prefetch(uri);
             const rootDocId = await this.detectRootDoc(vfs, uri);
             const outcome = await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
@@ -265,6 +270,9 @@ export class CompileManager {
             } else {
                 await this.update(logSummary?.errors.length ? 'hasErrors' : 'success');
             }
+            await CompileManager.afterCompile?.(vfs, outcome).catch((error) => {
+                this.log.warn(`Could not save the compile output locally: ${error}`);
+            });
             if (outcome.hasPdf) {
                 const { identifier } = parseUri(uri);
                 pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
@@ -550,6 +558,7 @@ export class CompileManager {
             this.log,
             // register compile commands
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, () => this.compile(true)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compileQuietly`, () => this.compile(false)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),
@@ -558,6 +567,8 @@ export class CompileManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setRootDoc`, () => this.setRootDoc()),
             // register compile conditions
             vscode.workspace.onDidSaveTextDocument(async (e) => {
+                // A folder sync saves every few moments while typing, which must not compile each time.
+                if (e.uri.scheme!==ROOT_NAME) { return; }
                 const uri = await CompileManager.check.bind(this)(e.uri);
                 const vfs = uri && await this.vfsm.prefetch(uri);
                 const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
