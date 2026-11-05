@@ -31,7 +31,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
 
     // Register: [sync] FolderSyncManager on Statusbar
-    const folderSyncManager = new FolderSyncManager(remoteFileSystemProvider, compileManager, context.extensionPath);
+    const folderSyncManager = new FolderSyncManager(remoteFileSystemProvider);
     context.subscriptions.push( ...folderSyncManager.triggers );
     folderSyncManager.resume();
 

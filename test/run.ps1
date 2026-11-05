@@ -10,7 +10,7 @@ Get-ChildItem Env: | Where-Object { $_.Name -like 'VSCODE_*' -or $_.Name -eq 'EL
 $env:OVERLEAF_AI_TEST_DIR = $run
 
 $failed = $false
-foreach ($suite in 'compile-tests.js', 'sync-tests.js', 'ai-tests.js', 'activation-tests.js') {
+foreach ($suite in 'compile-tests.js', 'sync-tests.js', 'activation-tests.js') {
   "=== $suite ==="
   foreach ($d in 'user-data', 'extensions', 'workspace') {
     Remove-Item -LiteralPath (Join-Path $run $d) -Recurse -Force -ErrorAction SilentlyContinue
@@ -27,7 +27,8 @@ foreach ($suite in 'compile-tests.js', 'sync-tests.js', 'ai-tests.js', 'activati
 
   $arguments = @(
     "--user-data-dir=`"$run\user-data`"", "--extensions-dir=`"$run\extensions`"",
-    "--extensionDevelopmentPath=`"$ExtensionDir`"", "--extensionTestsPath=`"$PSScriptRoot\$suite`"",
+    "--extensionDevelopmentPath=`"$ExtensionDir`"", "--extensionDevelopmentPath=`"$PSScriptRoot\fixtures\latex-workshop-stub`"",
+    "--extensionTestsPath=`"$PSScriptRoot\$suite`"",
     '--skip-welcome', '--skip-release-notes', '--disable-updates', '--new-window', "`"$run\workspace`""
   )
   $process = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru

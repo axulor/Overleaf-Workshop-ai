@@ -145,6 +145,7 @@ async function testSync(FolderSync) {
   check('first sync: documents arrive', c.read('main.tex') === 'hello\n' && c.read('sections/intro.tex') === 'intro\n');
   check('first sync: files arrive', c.read('figures/a.png') === 'PNGDATA');
   check('first sync: nothing is written online', c.remote.writes.length === 0);
+  check('first sync: the state folder stays out of git', c.read('.overleaf/.gitignore') === '*\n');
 
   // ---- no echo: syncing what just arrived must do nothing ----
   await sleep(SETTLE_MS);
@@ -184,15 +185,6 @@ async function testSync(FolderSync) {
   check('an online edit reaches the disk', await until(() => c.read('main.tex') === 'from a collaborator\n'));
   await sleep(SETTLE_MS);
   check('and is not echoed back', c.remote.writes.length === writesBefore);
-  const received = [];
-  c.sync.onDidReceive((p) => received.push(p));
-  c.remote.edit('main.tex', 'announced\n');
-  check('an online change is announced once it has arrived', await until(() => received.includes('main.tex') && c.read('main.tex') === 'announced\n'), JSON.stringify(received));
-  received.length = 0;
-  c.write('main.tex', 'from here\n');
-  await until(() => c.remote.docs.get('main.tex') === 'from here\n');
-  await sleep(SETTLE_MS);
-  check('a local change is not', received.length === 0, JSON.stringify(received));
   c.remote.addOnline('new/online.tex', 'new online\n');
   check('a new online file arrives', await until(() => c.exists('new/online.tex') && c.read('new/online.tex') === 'new online\n'));
   c.remote.replaceFile('figures/a.png', 'NEWPNG');
@@ -548,6 +540,29 @@ async function testProjectFolder(LocalReplicaSCMProvider) {
   check('a project name becomes a safe folder name', LocalReplicaSCMProvider.sanitizeProjectFolderName('A/B: 论文?') === 'A_B_ 论文_', LocalReplicaSCMProvider.sanitizeProjectFolderName('A/B: 论文?'));
 }
 
+// ---- working next to LaTeX Workshop ----
+
+async function testLatexWorkshop(FolderSyncManager) {
+  const AUTO_BUILD = ['latex-workshop.latex.autoBuild', 'run'];
+  const ALT_KEYMAP = ['latex-workshop.bind.altKeymap', 'enabled'];
+  const inWorkspace = ([section, key]) => vscode.workspace.getConfiguration(section).inspect(key)?.workspaceValue;
+  const setInWorkspace = ([section, key], value) => vscode.workspace.getConfiguration(section).update(key, value, vscode.ConfigurationTarget.Workspace);
+  const manager = new FolderSyncManager({});
+
+  check('setup: the stand-in for LaTeX Workshop is loaded', !!vscode.extensions.getExtension('James-Yu.latex-workshop'));
+  await manager.leaveCompilingToOverleaf();
+  check('LaTeX Workshop stops building on every change', inWorkspace(AUTO_BUILD) === 'never', String(inWorkspace(AUTO_BUILD)));
+  check('LaTeX Workshop gives up the compile shortcuts', inWorkspace(ALT_KEYMAP) === true, String(inWorkspace(ALT_KEYMAP)));
+
+  await setInWorkspace(AUTO_BUILD, 'onSave');
+  await setInWorkspace(ALT_KEYMAP, false);
+  await manager.leaveCompilingToOverleaf();
+  check('a choice already made in this workspace is kept', inWorkspace(AUTO_BUILD) === 'onSave' && inWorkspace(ALT_KEYMAP) === false, `${inWorkspace(AUTO_BUILD)} ${inWorkspace(ALT_KEYMAP)}`);
+
+  await setInWorkspace(AUTO_BUILD, undefined);
+  await setInWorkspace(ALT_KEYMAP, undefined);
+}
+
 // ---- linking a project, from any kind of window ----
 
 async function testLinking(FolderSyncManager, LocalReplicaSCMProvider) {
@@ -558,7 +573,7 @@ async function testLinking(FolderSyncManager, LocalReplicaSCMProvider) {
   const FOLDER = 'overleaf-My Test';
   const make = (overrides = {}) => {
     const seen = { started: [], opened: [], picked: 0, confirmed: [] };
-    const manager = new FolderSyncManager({}, {}, '');
+    const manager = new FolderSyncManager({});
     Object.assign(manager, {
       start: async (folder, uri) => { seen.started.push({ folder: folder.fsPath, uri: uri.toString() }); },
       openFolder: async (folder) => { seen.opened.push(folder.fsPath); },
@@ -640,6 +655,7 @@ exports.run = async function () {
   try {
     await testProjectFolder(require(path.join(out, 'scm', 'localReplicaSCM.js')).LocalReplicaSCMProvider);
     await testLinking(require(path.join(out, 'sync', 'index.js')).FolderSyncManager, require(path.join(out, 'scm', 'localReplicaSCM.js')).LocalReplicaSCMProvider);
+    await testLatexWorkshop(require(path.join(out, 'sync', 'index.js')).FolderSyncManager);
     const merge = require(path.join(out, 'sync', 'merge.js'));
     const { FolderSync } = require(path.join(out, 'sync', 'folderSync.js'));
     const { VirtualFileSystem } = require(path.join(out, 'core', 'remoteFileSystemProvider.js'));

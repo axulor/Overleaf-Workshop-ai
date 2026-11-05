@@ -17,6 +17,10 @@ exports.run = async function () {
     while (Date.now() < end && !extension.isActive) { await sleep(100); }
     check('opening a folder with a linked project activates the extension', extension.isActive);
     check('the command for linking is there', (await vscode.commands.getCommands(true)).includes('overleaf-workshop.sync.linkProject'));
+    // There is no login here, and LaTeX Workshop would still be building and showing errors on every change.
+    const autoBuild = () => vscode.workspace.getConfiguration('latex-workshop.latex.autoBuild').inspect('run')?.workspaceValue;
+    while (Date.now() < end && autoBuild() !== 'never') { await sleep(100); }
+    check('opening a linked project stops LaTeX Workshop building it, even before logging in', autoBuild() === 'never', String(autoBuild()));
   } catch (e) {
     results.push(`ERROR ${e && e.stack}`);
   } finally {

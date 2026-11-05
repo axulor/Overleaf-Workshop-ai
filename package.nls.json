@@ -1,6 +1,6 @@
 {
     "extension.displayName": "Overleaf Workshop AI",
-    "extension.description": "Work on Overleaf projects from a real local folder in VS Code, so AI coding assistants can edit them. A fork of Overleaf Workshop.",
+    "extension.description": "Keep an Overleaf project in a real local folder, and edit it in VS Code as if editing online. A fork of Overleaf Workshop.",
 
     "commands.remoteFileSystem.refreshLinkedFile.title": "Overleaf: Refresh File",
     "commands.remoteFileSystem.createLinkedFile.title": "Overleaf: Import File ...",
@@ -38,7 +38,7 @@
     "commands.projectHistory.revealHistoryView.title": "Focus on Overleaf History View",
     "commands.projectSCM.configSCM.title": "Configure Source Control ...",
 
-    "commands.compileManager.compile.title": "Compile Project",
+    "commands.compileManager.compile.title": "Compile on Overleaf",
     "commands.compileManager.viewPdf.title": "View Compiled PDF",
     "commands.compileManager.syncCode.title": "Jump to PDF",
     "commands.compileManager.setCompiler.title": "Set Compiler",

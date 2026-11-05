@@ -3,10 +3,6 @@ import { CompileManager } from '../compile/compileManager';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { CompileOutcome, RemoteFileSystemProvider, VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { AiBridge } from '../ai/bridge';
-import { setUpForAssistants } from '../ai/projectSetup';
-import { TranslationState } from '../ai/translationState';
-import { listUnsavedTyporaFiles } from '../ai/typora';
 import { ConflictReason, DEFAULT_IGNORE_PATTERNS, FolderSync, SyncStatus } from './folderSync';
 import { VfsRemoteSide } from './vfsRemoteSide';
 
@@ -26,15 +22,10 @@ const COMPARE = '查看差异';
 export class FolderSyncManager {
     private sync?: FolderSync;
     private remote?: VfsRemoteSide;
-    private bridge?: AiBridge;
     private readonly log = vscode.window.createOutputChannel('Overleaf Workshop AI Sync', {log: true});
     private readonly statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -2);
 
-    constructor(
-        private readonly provider: RemoteFileSystemProvider,
-        private readonly compileManager: CompileManager,
-        private readonly extensionPath: string,
-    ) {
+    constructor(private readonly provider: RemoteFileSystemProvider) {
         this.statusItem.command = `${ROOT_NAME}.sync.showStatus`;
     }
 
@@ -139,7 +130,31 @@ export class FolderSyncManager {
         }
     }
 
+    /**
+     * In a synced project LaTeX Workshop sees real .tex files. It would build them locally on every change,
+     * which fails with an error popup where no TeX is installed, and it would take the compile shortcuts.
+     * Only this workspace is changed, and a value already set here is left alone.
+     */
+    private async leaveCompilingToOverleaf() {
+        if (!vscode.extensions.getExtension('James-Yu.latex-workshop')) { return; }
+        const settings: [section: string, key: string, value: unknown][] = [
+            ['latex-workshop.latex.autoBuild', 'run', 'never'],
+            ['latex-workshop.bind.altKeymap', 'enabled', true],
+        ];
+        for (const [section, key, value] of settings) {
+            try {
+                const config = vscode.workspace.getConfiguration(section);
+                if (config.inspect(key)?.workspaceValue === undefined) {
+                    await config.update(key, value, vscode.ConfigurationTarget.Workspace);
+                }
+            } catch (error) {
+                this.log.warn(`Could not set ${section}.${key}: ${error instanceof Error ? error.message : error}`);
+            }
+        }
+    }
+
     private async start(folder: vscode.Uri, projectUri: vscode.Uri, ignorePatterns?: string[]) {
+        await this.leaveCompilingToOverleaf();
         const previous = this.sync;
         this.stop();
         await previous?.stop();
@@ -172,7 +187,6 @@ export class FolderSyncManager {
 
             await this.sync.start();
             this.log.info(`Syncing ${folder.fsPath} with ${parseUri(projectUri).projectName}`);
-            await this.startAssistantTools(this.sync, folder, parseUri(projectUri).projectName);
         } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
             this.log.error(`Could not start syncing: ${reason}`);
@@ -180,49 +194,9 @@ export class FolderSyncManager {
         }
     }
 
-    /** Offers AI assistants what they cannot do by editing files. A failure here must not affect syncing. */
-    private async startAssistantTools(sync: FolderSync, folder: vscode.Uri, projectName: string) {
-        const root = this.workspaceFolder();
-        if (!root) { return; }
-        try {
-            const translation = new TranslationState(root, folder);
-            sync.onDidReceive((path) => translation.noteReceived(path));
-            const projectFolder = vscode.workspace.asRelativePath(folder, false);
-
-            this.bridge = new AiBridge(folder, {
-                status: async () => ({projectName, projectFolder, ...sync.status}),
-                compile: async () => {
-                    const report = await this.compileManager.compileAndReport();
-                    if (!report) { return {status: 'nothing-to-compile', errors: [], warningCount: 0}; }
-                    return {
-                        ...report,
-                        pdf: report.hasPdf ? `${projectFolder}/${OUTPUT_FOLDER_NAME}/output.pdf` : undefined,
-                        log: report.hasLog ? `${projectFolder}/${OUTPUT_FOLDER_NAME}/output.log` : undefined,
-                    };
-                },
-                // eslint-disable-next-line @typescript-eslint/naming-convention
-                translation_changes: async () => {
-                    await sync.flush(); // typing still in the editor belongs in what is compared
-                    return {...await translation.changes(), typoraUnsaved: await listUnsavedTyporaFiles()};
-                },
-                // eslint-disable-next-line @typescript-eslint/naming-convention
-                translation_mark_synced: async (args) => {
-                    await sync.flush();
-                    return translation.markSynced(Array.isArray(args.edited) ? args.edited : []);
-                },
-            });
-            await this.bridge.start();
-            await setUpForAssistants(root, folder, this.extensionPath, (message) => this.log.warn(message));
-        } catch (error) {
-            this.log.warn(`The tools for AI assistants are not available: ${error instanceof Error ? error.message : error}`);
-        }
-    }
-
     private stop() {
-        this.bridge?.dispose();
         this.sync?.dispose();
         this.remote?.dispose();
-        this.bridge = undefined;
         this.sync = undefined;
         this.remote = undefined;
         CompileManager.beforeCompile = undefined;

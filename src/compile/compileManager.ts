@@ -17,13 +17,6 @@ const severityMap: Record<string, vscode.DiagnosticSeverity> = {
 const documentClassRegex = new RegExp(/\\documentclass(?:\[[^\[\]\{\}]*\])?\{([^\[\]\{\}]+)\}/);
 
 const RECOMPILE_FROM_SCRATCH = '从零重新编译';
-const WAIT_FOR_COMPILE_MS = 60000;
-const WAIT_STEP_MS = 100;
-
-export interface CompileReport extends CompileOutcome {
-    errors: string[];
-    warningCount: number;
-}
 
 // Overleaf does not document its statuses. An unknown one is shown as it is.
 /* eslint-disable @typescript-eslint/naming-convention */
@@ -249,7 +242,7 @@ export class CompileManager {
         return uri;
     }
 
-    async compile(force:boolean=false): Promise<CompileReport|undefined> {
+    async compile(force:boolean=false) {
         if (this.inCompiling) { return; }
         await vscode.workspace.saveAll(); // save all dirty files
 
@@ -268,10 +261,9 @@ export class CompileManager {
 
             const logSummary = outcome.hasLog ? await this.diagnosticProvider.updateDiagnostics(uri) : undefined;
             this.report(outcome, force, logSummary);
-            const report: CompileReport = {...outcome, errors: logSummary?.errors ?? [], warningCount: logSummary?.warningCount ?? 0};
             if (outcome.status==='request-failed') {
                 await this.update('alert');
-                return report;
+                return;
             }
             if (outcome.status!=='success') {
                 await this.update('failed');
@@ -291,7 +283,6 @@ export class CompileManager {
                     await this.openPdf(true);
                 }
             }
-            return report;
         } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
             this.log.error(`Compile stopped by an error: ${reason}`);
@@ -299,19 +290,10 @@ export class CompileManager {
                 this.showCompileProblem(`编译时出错：${reason}`);
             }
             await this.update('failed');
-            return {status: 'error', message: reason, rootResourcePath: null, elapsedMs: 0, hasLog: false, hasPdf: false, errors: [], warningCount: 0};
         } finally {
             // Whatever happened, a later compile must not be ignored as "already compiling".
             this.inCompiling = false;
         }
-    }
-
-    /** Compiles as soon as any compile in progress has finished, for a caller that needs this compile's result. */
-    async compileAndReport(): Promise<CompileReport|undefined> {
-        for (let waited = 0; this.inCompiling && waited < WAIT_FOR_COMPILE_MS; waited += WAIT_STEP_MS) {
-            await new Promise((resolve) => setTimeout(resolve, WAIT_STEP_MS));
-        }
-        return this.compile(true);
     }
 
     /** The active document is the main document if it has \documentclass; anything else uses the project's setting. */

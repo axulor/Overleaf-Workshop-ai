@@ -2,7 +2,7 @@
 
 An unofficial fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop) by iamhyc and contributors, under the same AGPL-3.0 license. It is not affiliated with Overleaf or with the original project, and it cannot run alongside the original extension: disable that one first.
 
-The goal is to work on an Overleaf project from a real local folder, with AI coding assistants editing the files directly and changes reaching Overleaf in real time. That work is in progress.
+It keeps an Overleaf project in a real local folder, so that editing it with any tool feels like editing it online: changes reach collaborators in real time, and compiling happens on Overleaf.
 
 ### Syncing a project to a local folder
 
@@ -24,15 +24,6 @@ Open your paper's folder, hover over a project in the Overleaf panel and click t
 - Compile results are copied to `.output/` in the project folder. A compile first sends all pending changes.
 - Changes made while VS Code is closed or offline are merged when it reconnects.
 
-### Working with an AI assistant
-
-Because the project is a real folder, an assistant edits it with its ordinary tools, and the edits reach Overleaf by themselves. When a project starts syncing, the extension also sets up the workspace for assistants that read `.mcp.json`, such as Claude Code:
-
-- Four tools, offered through a small local MCP server: `status`, `compile` (which returns every LaTeX error), `translation_changes` and `translation_mark_synced`. The server only talks to the VS Code window that has the project open, on this machine.
-- A `/sync` command in `.claude/commands/sync.md`, for keeping a Chinese manuscript in `zh/` and the English LaTeX in step, in both directions, changing only what changed. To adapt it, edit the file and remove its marker line, and it will be left alone.
-
-The assistant still works from your files and your instructions: its edits reach collaborators as it makes them, like anyone else's.
-
 ### Compiling
 
 - A PDF with LaTeX errors in its log no longer shows as a failed compile. As on Overleaf's own page, the PDF is available and the errors are listed in the Problems panel.
@@ -42,6 +33,7 @@ The assistant still works from your files and your instructions: its edits reach
 - A manual compile is no longer sent to Overleaf as an auto-compile.
 - An error during a compile no longer blocks later compiles until the window is reloaded.
 - A project with no main document set uses `main.tex` or its only `.tex` file, and asks if neither applies.
+- Next to LaTeX Workshop, a synced workspace turns off its automatic local builds and its compile shortcuts, in `.vscode/settings.json`, so `Ctrl+Alt+B` compiles on Overleaf and no local build fails on every change. A value already set in the workspace is left alone. LaTeX Workshop's own ▶ button stays and still builds locally; the button that compiles on Overleaf has a cloud icon.
 
 To run the tests, which use fake Overleaf responses and need no account: `powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1`. To try this build against a real account without touching your own VS Code: `test\dev-window.ps1`.
 

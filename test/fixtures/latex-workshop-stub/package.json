@@ -1,0 +1,16 @@
+{
+  "name": "latex-workshop",
+  "displayName": "Stand-in for LaTeX Workshop in the tests",
+  "publisher": "James-Yu",
+  "version": "0.0.0",
+  "engines": { "vscode": "^1.0.0" },
+  "contributes": {
+    "configuration": {
+      "title": "LaTeX Workshop",
+      "properties": {
+        "latex-workshop.latex.autoBuild.run": { "scope": "resource", "type": "string", "default": "onFileChange" },
+        "latex-workshop.bind.altKeymap.enabled": { "scope": "window", "type": "boolean", "default": false }
+      }
+    }
+  }
+}
