@@ -46,7 +46,14 @@ function callBridge(tool: string, args: unknown): Promise<unknown> {
             const end = received.indexOf('\n');
             if (end < 0) { return; }
             socket.end();
-            const reply = JSON.parse(received.slice(0, end));
+            // A bridge file left by a window that closed can point at a port some other program now uses.
+            let reply: { result?: unknown, error?: string };
+            try {
+                reply = JSON.parse(received.slice(0, end));
+            } catch {
+                reject(new Error(NOT_RUNNING));
+                return;
+            }
             if (reply.error !== undefined) {
                 reject(new Error(reply.error));
             } else {

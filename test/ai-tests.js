@@ -254,6 +254,15 @@ async function testMcp({ AiBridge }, { TOOLS }) {
   fs.writeFileSync(bridgeFile, JSON.stringify({ port, token }));
   call = await server.rpc('tools/call', { name: 'status' });
   check('mcp: with a stale bridge file, too', call.result.isError === true && call.result.content[0].text.includes('open the workspace folder'), JSON.stringify(call));
+
+  // that stale file can point at a port some other program has taken since
+  const stranger = net.createServer((socket) => { socket.on('error', () => {}); socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
+  await new Promise((resolve) => stranger.listen(0, '127.0.0.1', resolve));
+  fs.writeFileSync(bridgeFile, JSON.stringify({ port: stranger.address().port, token: 'stale' }));
+  call = await server.rpc('tools/call', { name: 'status' });
+  stranger.close();
+  check('mcp: if another program answers, the tool says what to do', call.result?.isError === true && call.result.content[0].text.includes('open the workspace folder'), JSON.stringify(call));
+  check('mcp: and the server keeps running', (await server.rpc('ping')).result !== undefined);
   server.child.stdin.end();
   const exited = await new Promise((resolve) => { server.child.on('exit', () => resolve(true)); setTimeout(() => resolve(false), 5000); });
   check('mcp: the server exits when the assistant goes away', exited);
