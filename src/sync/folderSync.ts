@@ -107,6 +107,9 @@ export class FolderSync implements vscode.Disposable {
     private readonly disposables: vscode.Disposable[] = [];
     private readonly stateEmitter = new vscode.EventEmitter<SyncStatus>();
     readonly onDidChangeStatus = this.stateEmitter.event;
+    private readonly receiveEmitter = new vscode.EventEmitter<string>();
+    /** Fires a project path when an online change has reached the local file. */
+    readonly onDidReceive = this.receiveEmitter.event;
 
     private manifest: Manifest = { version: 1, files: {} };
     private readonly timers = new Map<string, NodeJS.Timeout>();
@@ -147,6 +150,7 @@ export class FolderSync implements vscode.Disposable {
         this.disposables.push(
             watcher,
             this.stateEmitter,
+            this.receiveEmitter,
             watcher.onDidCreate((uri) => this.onLocalChange(uri)),
             watcher.onDidChange((uri) => this.onLocalChange(uri)),
             watcher.onDidDelete((uri) => this.onLocalDelete(uri)),
@@ -482,6 +486,7 @@ export class FolderSync implements vscode.Disposable {
                 await this.writeLocalText(path, remoteText!);
                 await this.settleDoc(path, remoteText!);
                 this.report(`Received ${path}`);
+                this.receiveEmitter.fire(path);
                 break;
             case 'push':
                 if (entry) {
@@ -508,6 +513,7 @@ export class FolderSync implements vscode.Disposable {
                     if (merged.text !== remoteText) { await this.remote.writeDoc(path, merged.text); }
                     await this.settleDoc(path, merged.text);
                     this.report(`Merged ${path}`);
+                    this.receiveEmitter.fire(path);
                 } else {
                     await this.markConflict(path, 'sameRegion', remoteText);
                 }

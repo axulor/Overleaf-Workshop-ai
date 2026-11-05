@@ -24,6 +24,15 @@ Open your paper's folder, hover over a project in the Overleaf panel and click t
 - Compile results are copied to `.output/` in the project folder. A compile first sends all pending changes.
 - Changes made while VS Code is closed or offline are merged when it reconnects.
 
+### Working with an AI assistant
+
+Because the project is a real folder, an assistant edits it with its ordinary tools, and the edits reach Overleaf by themselves. When a project starts syncing, the extension also sets up the workspace for assistants that read `.mcp.json`, such as Claude Code:
+
+- Four tools, offered through a small local MCP server: `status`, `compile` (which returns every LaTeX error), `translation_changes` and `translation_mark_synced`. The server only talks to the VS Code window that has the project open, on this machine.
+- A `/sync` command in `.claude/commands/sync.md`, for keeping a Chinese manuscript in `zh/` and the English LaTeX in step, in both directions, changing only what changed. To adapt it, edit the file and remove its marker line, and it will be left alone.
+
+The assistant still works from your files and your instructions: its edits reach collaborators as it makes them, like anyone else's.
+
 ### Compiling
 
 - A PDF with LaTeX errors in its log no longer shows as a failed compile. As on Overleaf's own page, the PDF is available and the errors are listed in the Problems panel.

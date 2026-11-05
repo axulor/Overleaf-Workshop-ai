@@ -184,6 +184,15 @@ async function testSync(FolderSync) {
   check('an online edit reaches the disk', await until(() => c.read('main.tex') === 'from a collaborator\n'));
   await sleep(SETTLE_MS);
   check('and is not echoed back', c.remote.writes.length === writesBefore);
+  const received = [];
+  c.sync.onDidReceive((p) => received.push(p));
+  c.remote.edit('main.tex', 'announced\n');
+  check('an online change is announced once it has arrived', await until(() => received.includes('main.tex') && c.read('main.tex') === 'announced\n'), JSON.stringify(received));
+  received.length = 0;
+  c.write('main.tex', 'from here\n');
+  await until(() => c.remote.docs.get('main.tex') === 'from here\n');
+  await sleep(SETTLE_MS);
+  check('a local change is not', received.length === 0, JSON.stringify(received));
   c.remote.addOnline('new/online.tex', 'new online\n');
   check('a new online file arrives', await until(() => c.exists('new/online.tex') && c.read('new/online.tex') === 'new online\n'));
   c.remote.replaceFile('figures/a.png', 'NEWPNG');
@@ -549,7 +558,7 @@ async function testLinking(FolderSyncManager, LocalReplicaSCMProvider) {
   const FOLDER = 'overleaf-My Test';
   const make = (overrides = {}) => {
     const seen = { started: [], opened: [], picked: 0, confirmed: [] };
-    const manager = new FolderSyncManager({});
+    const manager = new FolderSyncManager({}, {}, '');
     Object.assign(manager, {
       start: async (folder, uri) => { seen.started.push({ folder: folder.fsPath, uri: uri.toString() }); },
       openFolder: async (folder) => { seen.opened.push(folder.fsPath); },

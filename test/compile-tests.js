@@ -199,6 +199,24 @@ async function testManager(CompileManager) {
   check('a PDF with LaTeX errors shows a warning', manager.status.text.includes('$(warning)'), manager.status.text);
   check('the record counts the LaTeX errors', seen.record.some((l) => l.includes('LaTeX errors 1')), JSON.stringify(seen.record));
   check('the record names the first error', seen.record.some((l) => l.includes('Undefined control sequence')), JSON.stringify(seen.record));
+
+  vfs = makeVfs(() => outcome('success', { hasLog: true, hasPdf: true }), { fileType: 'folder' }, LOG_WITH_ERROR);
+  manager = managerFor(vfs);
+  watched(manager);
+  let report = await manager.compile(true);
+  check('a compile reports its LaTeX errors to the caller', report.status === 'success' && report.errors.length === 1 && report.errors[0].includes('main.tex:3') && report.errors[0].includes('Undefined control sequence'), JSON.stringify(report));
+  vfs = makeVfs(() => { throw new Error('socket closed'); });
+  manager = managerFor(vfs);
+  watched(manager);
+  report = await manager.compile(true);
+  check('a compile reports an exception to the caller', report.status === 'error' && report.message === 'socket closed', JSON.stringify(report));
+  vfs = makeVfs(() => outcome('success'));
+  manager = managerFor(vfs);
+  watched(manager);
+  manager.inCompiling = true;
+  setTimeout(() => { manager.inCompiling = false; }, 400);
+  report = await manager.compileAndReport();
+  check('a caller waiting for a result waits out a compile in progress', report?.status === 'success' && vfs.calls.compile.length === 1, JSON.stringify(report));
   check('a PDF with LaTeX errors still opens', seen.opened.length === 1);
 
   vfs = makeVfs(() => outcome('success', { hasLog: true, hasPdf: true }), { fileType: 'folder' }, 'clean log\n');
