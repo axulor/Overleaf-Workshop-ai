@@ -33,10 +33,10 @@ export function activate(context: vscode.ExtensionContext) {
     // Register: [sync] FolderSyncManager on Statusbar
     const folderSyncManager = new FolderSyncManager(remoteFileSystemProvider);
     context.subscriptions.push( ...folderSyncManager.triggers );
-    folderSyncManager.resume();
 
-    // activate vfs for local replica
-    LocalReplicaSCMProvider.readSettings()
+    // activate vfs for local replica, after a synced folder has been dealt with, which does it in its own way
+    folderSyncManager.resume()
+    .then(() => folderSyncManager.hasLinkedFolder ? undefined : LocalReplicaSCMProvider.readSettings())
     .then(async setting => {
         if (setting?.uri) {
             const uri = vscode.Uri.parse(setting.uri);

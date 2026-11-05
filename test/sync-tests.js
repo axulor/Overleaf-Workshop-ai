@@ -6,7 +6,10 @@ const path = require('path');
 const here = process.env.OVERLEAF_AI_TEST_DIR;
 const out = path.join(__dirname, '..', 'out');
 const results = [];
-const check = (name, ok, detail = '') => results.push(`${ok ? 'PASS' : 'FAIL'} ${name} ${detail}`);
+const check = (name, ok, detail = '') => {
+  results.push(`${ok ? 'PASS' : 'FAIL'} ${name} ${detail}`);
+  fs.appendFileSync(path.join(here, 'progress.txt'), `${results[results.length - 1]}\n`); // to show where a run got stuck
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(condition, ms = 6000) {
   const end = Date.now() + ms;
@@ -29,6 +32,9 @@ class FakeRemote {
     this.renames = [];
     this.fileReads = 0;
     this.failWrites = false;
+    this.folders = new Set();
+    this.foldersCreated = [];
+    this.foldersRemoved = [];
     this.changed = new vscode.EventEmitter();
     this.connected = new vscode.EventEmitter();
     this.disconnected = new vscode.EventEmitter();
@@ -38,9 +44,46 @@ class FakeRemote {
   }
   async list() {
     return [
-      ...[...this.docs.keys()].map((p) => ({ path: p, kind: 'doc', version: `doc:${p}` })),
+      ...[...this.docs.keys()].map((p) => ({ path: p, kind: 'doc', version: `doc:${this.moved?.get(p) ?? p}` })),
       ...[...this.files].map(([p, f]) => ({ path: p, kind: 'file', version: `${p}:${f.version}` })),
     ];
+  }
+  async listFolders() {
+    // As on Overleaf, a folder stays after its files have gone.
+    for (const p of [...this.docs.keys(), ...this.files.keys()]) {
+      const parts = p.split('/');
+      for (let depth = 1; depth < parts.length; depth++) this.folders.add(parts.slice(0, depth).join('/'));
+    }
+    return [...this.folders];
+  }
+  async createFolder(p) {
+    if (this.failWrites || this.refusedFolder === p) throw new Error('offline');
+    this.foldersCreated.push(p);
+    this.folders.add(p);
+  }
+  async removeFolder(p) {
+    if (this.failWrites) throw new Error('offline');
+    this.foldersRemoved.push(p);
+    this.folders.delete(p);
+  }
+  // what a collaborator does to folders
+  addFolderOnline(p) { this.folders.add(p); this.changed.fire(undefined); }
+  removeFolderOnline(p) {
+    for (const each of [...this.folders]) { if (each === p || each.startsWith(`${p}/`)) this.folders.delete(each); }
+    for (const store of [this.docs, this.files]) {
+      for (const each of [...store.keys()]) { if (each.startsWith(`${p}/`)) store.delete(each); }
+    }
+    this.changed.fire(undefined);
+  }
+  /** A move online keeps the file's identity, which a fake version number has to say explicitly. */
+  moveOnline(from, to) {
+    this.moved = this.moved ?? new Map();
+    this.moved.set(to, this.moved.get(from) ?? from);
+    this.moved.delete(from);
+    for (const store of [this.docs, this.files]) {
+      if (store.has(from)) { store.set(to, store.get(from)); store.delete(from); }
+    }
+    this.changed.fire(undefined);
   }
   async readDoc(p) {
     const text = this.docs.get(p);
@@ -68,7 +111,13 @@ class FakeRemote {
       this.files.set(p, { content: Buffer.from(content), version: (previous?.version ?? 0) + 1 });
     }
   }
-  async remove(p) { this.removed.push(p); this.docs.delete(p); this.files.delete(p); }
+  async remove(p) {
+    // On the real thing this takes a moment, and what it says about the file tree makes the engine look at everything.
+    if (this.removeDelayMs) { this.changed.fire(undefined); await sleep(this.removeDelayMs); }
+    this.removed.push(p);
+    this.docs.delete(p);
+    this.files.delete(p);
+  }
   async rename(from, to) {
     if (this.failWrites) throw new Error('offline');
     if (this.renameDelayMs) await sleep(this.renameDelayMs);
@@ -1257,6 +1306,20 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   check('comments: and what is showing stays', !!thread('t3'));
   source.failing = false;
 
+  // no longer being kept up to date is said in the file, as a tool reading it could not tell
+  await comments.markOutOfDate('This has stopped being updated.');
+  check('comments: the plain file says when it has stopped being updated', listing().includes('This has stopped being updated.') && !listing().includes('Kept up to date'), listing().split('\n')[2]);
+  await comments.markOutOfDate(undefined);
+
+  // the folder being deleted is noticed a moment later, and writing in that moment must not bring it back
+  const away = `${folder} moved away`;
+  fs.renameSync(folder, away);
+  source.comments = [...source.comments, comment('t-late', 'nothing', 0, { messages: [{ author: 'Ada Lovelace', text: 'late', time: 1793865710629 }] })];
+  emitter.fire();
+  await sleep(SETTLE_MS);
+  check('comments: writing does not bring back a deleted folder', !fs.existsSync(folder));
+  fs.renameSync(away, folder);
+
   comments.dispose();
   const finalText = listing();
   put(later, 'y\nx arrives\n');
@@ -1651,6 +1714,24 @@ async function testConnection(SocketIOAPI) {
   fire('joinProjectResponse', { publicId: 'b', project: { name: 'second' } });
   check('after a drop: the new connection\'s answer is', (await pending).name === 'second');
   check('after a drop: and it stays until the next drop', (await api.joinProject('p1')).name === 'second');
+
+  // leaving also stops any waiting to reconnect, which a plain disconnect does not
+  let reconnected = false;
+  let closedConnection = 0;
+  const waiting = {
+    options: { reconnect: true },
+    reconnecting: true,
+    reconnectionTimer: setTimeout(() => { reconnected = true; }, 80),
+  };
+  const leaving = new SocketIOAPI('https://www.overleaf.com/', { _initSocketV0: () => ({ ...socket, socket: waiting, disconnect() { closedConnection++; } }) }, { cookies: '', csrfToken: '' }, 'p1');
+  leaving.scheme = 'v2';
+  leaving.init();
+  closedConnection = 0;
+  leaving.close();
+  await sleep(200);
+  check('closing: a reconnect that was waiting does not happen', !reconnected && waiting.reconnecting === false);
+  check('closing: and none starts later', waiting.options.reconnect === false);
+  check('closing: the connection itself is closed', closedConnection === 1);
 }
 
 // ---- working next to LaTeX Workshop ----
@@ -1686,8 +1767,9 @@ async function testLinking(FolderSyncManager, LocalReplicaSCMProvider) {
   const FOLDER = 'overleaf-My Test';
   const make = (overrides = {}) => {
     const seen = { started: [], opened: [], picked: 0, confirmed: [] };
-    const manager = new FolderSyncManager({});
+    const manager = new FolderSyncManager({ setGate() {}, forget() {} });
     Object.assign(manager, {
+      startTicking: () => {},
       start: async (folder, uri) => { seen.started.push({ folder: folder.fsPath, uri: uri.toString() }); },
       openFolder: async (folder) => { seen.opened.push(folder.fsPath); },
       pickParentFolder: async () => { seen.picked++; return undefined; },
@@ -1764,6 +1846,769 @@ async function testLinking(FolderSyncManager, LocalReplicaSCMProvider) {
   LocalReplicaSCMProvider.forgetProjectRoot();
 }
 
+/** Folders exist in their own right: an empty one syncs, and one emptied on one side goes on the other. */
+async function testFolders(FolderSync) {
+  const settle = async (t) => { await t.sync.flush(); await sleep(SETTLE_MS); await t.sync.flush(); };
+
+  let remote = new FakeRemote({ 'main.tex': 'a\n' });
+  let t = await setup(FolderSync, remote);
+  fs.mkdirSync(path.join(t.root, 'figures', 'plots'), { recursive: true });
+  await until(() => remote.foldersCreated.includes('figures/plots'));
+  await settle(t);
+  check('a new empty local folder appears online', remote.folders.has('figures/plots'), JSON.stringify(remote.foldersCreated));
+  check('and the folder above it', remote.folders.has('figures'));
+
+  remote.addFolderOnline('tables/raw');
+  await until(() => t.exists('tables/raw'));
+  check('a new empty online folder appears locally', t.exists('tables/raw'));
+  check('nothing else was created online for it', !remote.foldersCreated.includes('tables/raw'), JSON.stringify(remote.foldersCreated));
+
+  remote.foldersRemoved.length = 0;
+  const askedBefore = t.asked.length;
+  fs.rmdirSync(path.join(t.root, 'figures', 'plots'));
+  await until(() => remote.foldersRemoved.includes('figures/plots'));
+  await settle(t);
+  check('an empty folder deleted locally goes online', !remote.folders.has('figures/plots') && remote.foldersRemoved.includes('figures/plots'), JSON.stringify(remote.foldersRemoved));
+  check('an empty folder needs no question', t.asked.length === askedBefore);
+  check('its parent stays', remote.folders.has('figures') && t.exists('figures'));
+
+  remote.removeFolderOnline('tables/raw');
+  await until(() => !t.exists('tables/raw'));
+  check('an empty folder deleted online goes locally', !t.exists('tables/raw'));
+  check('its parent stays locally', t.exists('tables'));
+  t.sync.dispose();
+
+  // a folder with files in it, deleted locally
+  remote = new FakeRemote({ 'main.tex': 'a\n', 'sec/one.tex': 'one\n', 'sec/two.tex': 'two\n' });
+  t = await setup(FolderSync, remote);
+  await settle(t);
+  fs.rmSync(path.join(t.root, 'sec'), { recursive: true });
+  await until(() => t.asked.length > 0);
+  await settle(t);
+  check('deleting a folder with files asks, once, about all of them', t.asked.length === 1 && t.asked[0].length === 2, JSON.stringify(t.asked));
+  check('answering no brings the files back', t.read('sec/one.tex') === 'one\n' && t.read('sec/two.tex') === 'two\n');
+  check('answering no leaves online alone', remote.docs.has('sec/one.tex') && remote.foldersRemoved.length === 0, JSON.stringify(remote.foldersRemoved));
+
+  t.answer = true;
+  fs.rmSync(path.join(t.root, 'sec'), { recursive: true });
+  await until(() => t.asked.length > 1);
+  await until(() => remote.foldersRemoved.includes('sec'));
+  await settle(t);
+  check('answering yes deletes the files online', !remote.docs.has('sec/one.tex') && !remote.docs.has('sec/two.tex'));
+  check('answering yes is the end of the question', t.asked.length === 2, JSON.stringify(t.asked));
+  check('and then the folder', remote.foldersRemoved.includes('sec'), JSON.stringify(remote.foldersRemoved));
+  check('the local folder stays deleted', !t.exists('sec'));
+  check('the rest of the project is untouched', remote.docs.get('main.tex') === 'a\n' && t.read('main.tex') === 'a\n');
+  t.sync.dispose();
+
+  // deleting takes time, and the question must not come round again in the meantime
+  remote = new FakeRemote({ 'main.tex': 'a\n', 'sec/one.tex': 'one\n', 'sec/two.tex': 'two\n', 'sec/three.tex': 'three\n' });
+  t = await setup(FolderSync, remote);
+  await settle(t);
+  remote.removeDelayMs = 700;
+  t.answer = true;
+  fs.rmSync(path.join(t.root, 'sec'), { recursive: true });
+  await until(() => t.asked.length > 0);
+  await until(() => remote.removed.length === 3, 10000);
+  await sleep(SETTLE_MS * 2);
+  check('a slow delete online asks only once', t.asked.length === 1, JSON.stringify(t.asked));
+  check('and every file went', remote.removed.length === 3 && !remote.docs.has('sec/one.tex'), JSON.stringify(remote.removed));
+  check('none deleted twice', new Set(remote.removed).size === 3);
+  t.sync.dispose();
+
+  // a folder with files in it, deleted online
+  remote = new FakeRemote({ 'main.tex': 'a\n', 'sec/one.tex': 'one\n' });
+  const deletedOnline = [];
+  t = await setup(FolderSync, remote, {}, { onOnlineDelete: (paths) => deletedOnline.push(...paths) });
+  await settle(t);
+  remote.removeFolderOnline('sec');
+  await until(() => !t.exists('sec'));
+  await until(() => deletedOnline.length > 0);
+  check('a folder deleted online goes locally, files and all', !t.exists('sec'));
+  check('deleting online is mentioned', deletedOnline.join() === 'sec/one.tex', JSON.stringify(deletedOnline));
+  check('nobody is asked about what already happened online', t.asked.length === 0);
+  const trash = path.join(t.root, '.overleaf', 'sync', 'trash');
+  check('the local copy can still be found', fs.existsSync(trash) && fs.readdirSync(trash, { recursive: true }).some((name) => String(name).endsWith('one.tex')));
+  t.sync.dispose();
+
+  // several deletions at once are one notice
+  remote = new FakeRemote({ 'a.tex': '1\n', 'b.tex': '2\n', 'c.tex': '3\n' });
+  const notices = [];
+  t = await setup(FolderSync, remote, {}, { onOnlineDelete: (paths) => notices.push([...paths]) });
+  await settle(t);
+  remote.docs.delete('a.tex'); remote.docs.delete('b.tex'); remote.changed.fire(undefined);
+  await until(() => notices.length > 0);
+  await sleep(1200);
+  check('several deleted together make one notice', notices.length === 1 && notices[0].length === 2, JSON.stringify(notices));
+  t.sync.dispose();
+
+  // an empty folder inside one being deleted goes with the answer about the files
+  remote = new FakeRemote({ 'main.tex': 'a\n', 'fig/one.tex': 'one\n' });
+  remote.folders.add('fig/sub');
+  let answerIt;
+  t = await setup(FolderSync, remote, {}, { confirmRemoteDelete: (paths) => new Promise((resolve) => { t.asked.push(paths); answerIt = resolve; }) });
+  await settle(t);
+  check('setup: the empty folder arrived', t.exists('fig/sub'));
+  fs.rmSync(path.join(t.root, 'fig'), { recursive: true });
+  await until(() => answerIt);
+  await sleep(SETTLE_MS);
+  remote.changed.fire(undefined);
+  await sleep(SETTLE_MS);
+  check('while the question is open, no folder goes online', remote.foldersRemoved.length === 0, JSON.stringify(remote.foldersRemoved));
+  answerIt(false);
+  await until(() => t.exists('fig/one.tex') && t.exists('fig/sub'));
+  check('answering no brings back the empty folder too', t.exists('fig/sub') && t.exists('fig/one.tex'));
+  await settle(t);
+  check('and nothing went online', remote.foldersRemoved.length === 0 && remote.removed.length === 0, JSON.stringify(remote.foldersRemoved));
+  answerIt = undefined;
+  fs.rmSync(path.join(t.root, 'fig'), { recursive: true });
+  await until(() => answerIt);
+  answerIt(true);
+  await until(() => remote.foldersRemoved.includes('fig'));
+  await settle(t);
+  check('answering yes takes the empty folder too', remote.foldersRemoved.includes('fig/sub') && remote.foldersRemoved.includes('fig'), JSON.stringify(remote.foldersRemoved));
+  check('and they stay gone', !t.exists('fig'));
+  t.sync.dispose();
+
+  // what is worth creating online
+  remote = new FakeRemote({ 'main.tex': 'a\n' });
+  t = await setup(FolderSync, remote);
+  await settle(t);
+  t.write('build/x.aux', 'ignored');
+  fs.mkdirSync(path.join(t.root, 'nested', 'deep'), { recursive: true });
+  t.write('onlybuild/inner/y.aux', 'ignored');
+  await until(() => remote.folders.has('nested/deep'));
+  await settle(t);
+  check('a folder holding only what does not sync stays local', !remote.foldersCreated.includes('build') && t.exists('build/x.aux'), JSON.stringify(remote.foldersCreated));
+  check('however deep', !remote.foldersCreated.some((p) => p.startsWith('onlybuild')), JSON.stringify(remote.foldersCreated));
+  check('an empty folder inside others is created', remote.folders.has('nested/deep'));
+  t.write('build/real.tex', 'real\n');
+  await until(() => remote.docs.has('build/real.tex'));
+  check('once it has something that syncs, it goes online', remote.docs.get('build/real.tex') === 'real\n');
+  t.sync.dispose();
+
+  // one folder refused
+  remote = new FakeRemote({ 'main.tex': 'a\n' });
+  t = await setup(FolderSync, remote);
+  await settle(t);
+  remote.refusedFolder = 'bad';
+  fs.mkdirSync(path.join(t.root, 'bad'));
+  fs.mkdirSync(path.join(t.root, 'good'));
+  fs.mkdirSync(path.join(t.root, 'zgood'));
+  await until(() => remote.folders.has('good') && remote.folders.has('zgood'));
+  check('a folder that is refused does not stop the others', remote.folders.has('good') && remote.folders.has('zgood') && !remote.folders.has('bad'), JSON.stringify(remote.foldersCreated));
+  check('and it stays locally', t.exists('bad'));
+  remote.refusedFolder = undefined;
+  remote.changed.fire(undefined);
+  await until(() => remote.folders.has('bad'));
+  check('and is tried again', remote.folders.has('bad'));
+  t.sync.dispose();
+
+  // a folder holding something that does not sync is not deleted with it
+  remote = new FakeRemote({ 'main.tex': 'a\n' });
+  remote.folders.add('keep');
+  t = await setup(FolderSync, remote);
+  await settle(t);
+  check('setup: the folder arrived', t.exists('keep'));
+  t.write('keep/.note', 'local only');
+  await settle(t);
+  check('setup: that file does not sync', ![...remote.docs.keys(), ...remote.files.keys()].includes('keep/.note'));
+  remote.removeFolderOnline('keep');
+  await sleep(SETTLE_MS * 2);
+  await settle(t);
+  check('a local file that does not sync survives its folder being deleted online', t.exists('keep/.note'));
+  t.sync.dispose();
+
+  // a failure is not recorded as having worked
+  remote = new FakeRemote({ 'main.tex': 'a\n' });
+  t = await setup(FolderSync, remote);
+  await settle(t);
+  remote.failWrites = true;
+  fs.mkdirSync(path.join(t.root, 'later'));
+  await sleep(SETTLE_MS);
+  await settle(t);
+  check('a folder that could not be created is still there locally', t.exists('later'));
+  remote.failWrites = false;
+  remote.changed.fire(undefined);
+  await until(() => remote.folders.has('later'));
+  check('and is created once that works', remote.folders.has('later'));
+  t.sync.dispose();
+
+  // folders survive a restart, and the first run with an older record loses nothing
+  remote = new FakeRemote({ 'main.tex': 'a\n' });
+  remote.folders.add('both');
+  t = await setup(FolderSync, remote, { 'localonly/x.tex': 'x\n' });
+  await settle(t);
+  await t.sync.stop();
+  check('setup: agreed folders are recorded', JSON.parse(fs.readFileSync(path.join(t.root, '.overleaf', 'sync', 'manifest.json'), 'utf8')).folders.includes('both'));
+  fs.rmdirSync(path.join(t.root, 'both'));
+  t.sync = t.make();
+  await t.sync.start();
+  await until(() => remote.foldersRemoved.includes('both'));
+  check('a folder deleted while nothing was running goes online too', remote.foldersRemoved.includes('both'));
+  t.sync.dispose();
+}
+
+/** Renames and moves online follow through, rather than looking like a deletion and a new file. */
+async function testOnlineRename(FolderSync) {
+  const settle = async (t) => { await t.sync.flush(); await sleep(SETTLE_MS); await t.sync.flush(); };
+  const noticed = [];
+  let remote = new FakeRemote({ 'old.tex': 'text\n', 'main.tex': 'm\n' });
+  let t = await setup(FolderSync, remote, {}, { onOnlineDelete: (paths) => noticed.push(...paths) });
+  await settle(t);
+
+  remote.moveOnline('old.tex', 'new.tex');
+  await until(() => t.exists('new.tex') && !t.exists('old.tex'));
+  await settle(t);
+  check('a rename online renames the local file', t.exists('new.tex') && !t.exists('old.tex') && t.read('new.tex') === 'text\n');
+  check('with no notice of a deletion', noticed.length === 0, JSON.stringify(noticed));
+  check('with nothing sent back', remote.writes.length === 0 && remote.renames.length === 0 && remote.removed.length === 0, JSON.stringify(remote.writes));
+  const trash = path.join(t.root, '.overleaf', 'sync', 'trash');
+  check('and nothing in the trash folder', !fs.existsSync(trash) || fs.readdirSync(trash).length === 0);
+
+  remote.moveOnline('new.tex', 'sec/deep/new.tex');
+  await until(() => t.exists('sec/deep/new.tex'));
+  await settle(t);
+  check('a move online into a new folder moves the local file', t.read('sec/deep/new.tex') === 'text\n' && !t.exists('new.tex'));
+
+  // a tab open on it follows, and a later edit reaches the right file
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(t.root, 'sec', 'deep', 'new.tex')));
+  await vscode.window.showTextDocument(document);
+  remote.moveOnline('sec/deep/new.tex', 'final.tex');
+  await until(() => t.exists('final.tex'));
+  await settle(t);
+  const open = vscode.window.activeTextEditor?.document.uri.fsPath;
+  check('a tab open on the file follows it', open && path.basename(open) === 'final.tex', open);
+  t.write('final.tex', 'text\nmore\n');
+  await until(() => remote.docs.get('final.tex') === 'text\nmore\n');
+  check('an edit after the move reaches the moved file', remote.docs.get('final.tex') === 'text\nmore\n', JSON.stringify(remote.docs.get('final.tex')));
+  await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+
+  // a local edit nobody has sent yet moves with the file
+  t.sync.dispose();
+  remote = new FakeRemote({ 'old.tex': 'one\n' });
+  t = await setup(FolderSync, remote);
+  await settle(t);
+  await t.sync.stop();
+  t.write('old.tex', 'one\nlocal\n');
+  remote.docs.delete('old.tex');
+  remote.docs.set('moved.tex', 'one\n');
+  remote.moved = new Map([['moved.tex', 'old.tex']]);
+  t.sync = t.make();
+  await t.sync.start();
+  await settle(t);
+  check('an unsent local edit moves with the file', t.exists('moved.tex') && t.read('moved.tex') === 'one\nlocal\n' && !t.exists('old.tex'), t.exists('moved.tex') ? t.read('moved.tex') : 'missing');
+  check('and is then sent', remote.docs.get('moved.tex') === 'one\nlocal\n', JSON.stringify(remote.docs.get('moved.tex')));
+  t.sync.dispose();
+
+  // an old copy being held moves with the file, and is not sent because of the move
+  remote = new FakeRemote({ 'held.tex': 'one\n' });
+  t = await setup(FolderSync, remote);
+  await settle(t);
+  const oldCopy = t.read('held.tex');
+  remote.edit('held.tex', 'one\nby Bob\n');
+  await until(() => t.read('held.tex').includes('by Bob'));
+  await sleep(1300);
+  t.write('held.tex', oldCopy);
+  await until(() => t.sync.status.conflicts.some((x) => x.reason === 'olderCopy'));
+  check('setup: an old copy is held', t.sync.status.conflicts.some((x) => x.reason === 'olderCopy'), JSON.stringify(t.sync.status));
+  remote.moveOnline('held.tex', 'held-moved.tex');
+  await until(() => t.exists('held-moved.tex'));
+  await settle(t);
+  check('a held file moved online moves locally', t.exists('held-moved.tex') && !t.exists('held.tex'));
+  check('it is not sent, which would remove the online edit', remote.docs.get('held-moved.tex') === 'one\nby Bob\n' && remote.writes.length === 0, JSON.stringify(remote.docs.get('held-moved.tex')));
+  check('it is still held, under its new name', t.sync.status.conflicts.some((x) => x.path === 'held-moved.tex' && x.reason === 'olderCopy'), JSON.stringify(t.sync.status.conflicts));
+  t.sync.dispose();
+
+  // where case does not count, a change of case is a rename and nothing else
+  if (process.platform === 'win32') {
+    const namesIn = (...parts) => fs.readdirSync(path.join(t.root, ...parts));
+    remote = new FakeRemote({ 'Main.tex': 'main\n', 'Figs/a.tex': 'a\n', 'Figs/b.tex': 'b\n', 'Local.tex': 'l\n', 'Mine/x.tex': 'x\n', 'other.tex': 'o\n' });
+    const noted = [];
+    t = await setup(FolderSync, remote, {}, { onOnlineDelete: (paths) => noted.push(...paths) });
+    await settle(t);
+
+    remote.moveOnline('Main.tex', 'main.tex');
+    await until(() => namesIn().includes('main.tex'));
+    await settle(t);
+    check('case changed online: the local name changes', namesIn().includes('main.tex') && !namesIn().includes('Main.tex'), namesIn().join());
+    check('case changed online: the content stays', t.read('main.tex') === 'main\n');
+    check('case changed online: not reported deleted', noted.length === 0, JSON.stringify(noted));
+    check('case changed online: nothing is asked', t.asked.length === 0, JSON.stringify(t.asked));
+    check('case changed online: nothing is sent back', remote.writes.length === 0 && remote.removed.length === 0 && remote.renames.length === 0, JSON.stringify(remote.writes));
+
+    remote.folders.delete('Figs');
+    remote.folders.add('figs');
+    remote.moveOnline('Figs/a.tex', 'figs/a.tex');
+    remote.moveOnline('Figs/b.tex', 'figs/b.tex');
+    await until(() => namesIn().includes('figs'));
+    await settle(t);
+    check('a folder\'s case changed online: the local name changes', namesIn().includes('figs') && !namesIn().includes('Figs'), namesIn().join());
+    check('a folder\'s case changed online: its files stay', namesIn('figs').sort().join() === 'a.tex,b.tex', namesIn('figs').join());
+    check('a folder\'s case changed online: nothing is duplicated', [...remote.docs.keys()].filter((p) => p.toLowerCase().startsWith('figs/')).length === 2 && remote.writes.length === 0, JSON.stringify([...remote.docs.keys()]));
+    check('a folder\'s case changed online: nothing is reported or asked', noted.length === 0 && t.asked.length === 0, JSON.stringify(noted));
+    t.write('figs/a.tex', 'a\nedited\n');
+    await until(() => remote.docs.get('figs/a.tex') === 'a\nedited\n');
+    check('and an edit after it reaches the right file', remote.docs.get('figs/a.tex') === 'a\nedited\n');
+
+    fs.renameSync(path.join(t.root, 'Local.tex'), path.join(t.root, 'local.tex'));
+    await until(() => remote.docs.has('local.tex'));
+    await settle(t);
+    check('case changed locally: renamed online', remote.renames.some((r) => r.from === 'Local.tex' && r.to === 'local.tex'), JSON.stringify(remote.renames));
+    check('case changed locally: no second document', !remote.docs.has('Local.tex') && remote.docs.get('local.tex') === 'l\n', JSON.stringify([...remote.docs.keys()]));
+    check('case changed locally: nothing is asked', t.asked.length === 0, JSON.stringify(t.asked));
+
+    fs.renameSync(path.join(t.root, 'Mine'), path.join(t.root, 'mine'));
+    await until(() => remote.docs.has('mine/x.tex'));
+    await settle(t);
+    check('a folder\'s case changed locally: its file is renamed online', !remote.docs.has('Mine/x.tex') && remote.docs.get('mine/x.tex') === 'x\n', JSON.stringify([...remote.docs.keys()]));
+    check('a folder\'s case changed locally: nothing is asked', t.asked.length === 0);
+    check('a folder\'s case changed locally: the file stays', namesIn().includes('mine') && namesIn('mine').join() === 'x.tex');
+    t.sync.dispose();
+  }
+
+  // a real deletion plus a real new file are not taken for a move
+  remote = new FakeRemote({ 'a.tex': 'same\n' });
+  const deleted = [];
+  t = await setup(FolderSync, remote, {}, { onOnlineDelete: (paths) => deleted.push(...paths) });
+  await settle(t);
+  remote.docs.delete('a.tex');
+  remote.docs.set('b.tex', 'same\n');
+  remote.changed.fire(undefined);
+  await until(() => t.exists('b.tex') && deleted.length > 0);
+  check('a new file with the same text is not a move', deleted.join() === 'a.tex' && t.exists('b.tex'), JSON.stringify(deleted));
+  t.sync.dispose();
+}
+
+/** Deleting the local folder is no statement about the online project. */
+async function testFolderDeleted(FolderSync) {
+  let linked = true;
+  const remote = new FakeRemote({ 'main.tex': 'a\n', 'sec/one.tex': 'one\n' });
+  const t = await setup(FolderSync, remote, {}, { stillLinked: async () => linked });
+  await t.sync.flush();
+  await sleep(SETTLE_MS);
+
+  linked = false;
+  fs.rmSync(t.root, { recursive: true, force: true });
+  await sleep(SETTLE_MS * 2);
+  check('deleting the whole folder asks nothing', t.asked.length === 0, JSON.stringify(t.asked));
+  check('and deletes nothing online', remote.removed.length === 0 && remote.foldersRemoved.length === 0 && remote.docs.size === 2);
+  remote.edit('main.tex', 'a\nfrom a collaborator\n');
+  await sleep(SETTLE_MS);
+  await t.sync.flush();
+  check('a later online edit does not bring the folder back', !fs.existsSync(t.root), fs.existsSync(t.root) ? fs.readdirSync(t.root).join() : '');
+  check('still nothing asked or deleted', t.asked.length === 0 && remote.removed.length === 0);
+  t.sync.dispose();
+
+  // a deletion answered while the folder goes
+  linked = true;
+  const remote2 = new FakeRemote({ 'main.tex': 'a\n', 'two.tex': 'two\n' });
+  let answering;
+  const t2 = await setup(FolderSync, remote2, {}, {
+    stillLinked: async () => linked,
+    confirmRemoteDelete: (paths) => new Promise((resolve) => { answering = () => resolve(true); t2.asked.push(paths); }),
+  });
+  await t2.sync.flush();
+  await sleep(SETTLE_MS);
+  t2.remove('two.tex');
+  await until(() => answering);
+  linked = false;
+  fs.rmSync(t2.root, { recursive: true, force: true });
+  answering();
+  await sleep(SETTLE_MS);
+  check('a yes given after the folder went deletes nothing', remote2.removed.length === 0 && remote2.docs.has('two.tex'), JSON.stringify(remote2.removed));
+  check('and brings back nothing', !fs.existsSync(t2.root));
+  t2.sync.dispose();
+
+  // an engine told to stop writes nothing more
+  const remote3 = new FakeRemote({ 'main.tex': 'a\n' });
+  const t3 = await setup(FolderSync, remote3);
+  await t3.sync.flush();
+  await sleep(SETTLE_MS);
+  fs.rmSync(t3.root, { recursive: true, force: true });
+  t3.sync.dispose();
+  await t3.sync.saveManifest();
+  check('a stopped engine does not recreate its records', !fs.existsSync(t3.root));
+}
+
+/** What the project's standing on Overleaf does to a linked folder. */
+async function testStanding(FolderSyncManager, LocalReplicaSCMProvider) {
+  const PROJECT = 'overleaf-workshop://www.overleaf.com/Paper?user=u&project=p9';
+  const parent = path.join(workspaceRoot(), 'standing');
+  const folder = path.join(parent, 'overleaf-Paper');
+  const settingsFile = path.join(folder, '.overleaf', 'settings.json');
+  const make = () => {
+    const seen = { started: 0, forgotten: 0, standing: 'active' };
+    const manager = new FolderSyncManager({
+      projectStanding: async () => { if (seen.standing === 'throws') throw new Error('offline'); return seen.standing; },
+      forget: () => { seen.forgotten++; },
+      setGate: (uri, open) => { seen.gate = open; },
+    });
+    Object.assign(manager, {
+      startTicking: () => {},
+      workspaceFolder: () => vscode.Uri.file(parent),
+      warnAboutOtherLinks: async () => {},
+      start: async (f, u) => {
+        seen.started++;
+        manager.folder = f; manager.projectUri = u; manager.paused = undefined;
+        LocalReplicaSCMProvider.detached = false;
+        manager.sync = { dispose() {}, stop: async () => {}, status: { connected: true, conflicts: [], failed: [], refused: [], pending: 0 } };
+      },
+    });
+    return { manager, seen };
+  };
+  const reset = () => {
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.mkdirSync(path.join(folder, '.overleaf'), { recursive: true });
+    fs.writeFileSync(settingsFile, JSON.stringify({ uri: PROJECT, projectName: 'Paper', enableCompileNPreview: true }));
+    fs.writeFileSync(path.join(folder, 'main.tex'), 'keep me\n');
+  };
+
+  // opening the window
+  reset();
+  let { manager, seen } = make();
+  await manager.resume();
+  check('active: syncing starts', seen.started === 1 && !LocalReplicaSCMProvider.detached);
+
+  seen.standing = 'trashed';
+  await manager.checkStanding();
+  check('moved to the trash: syncing pauses', manager.paused === 'trashed' && !manager.sync);
+  check('moved to the trash: the connection is closed', seen.forgotten === 1);
+  check('moved to the trash: nothing can reconnect by itself', LocalReplicaSCMProvider.detached === true && (await LocalReplicaSCMProvider.readSettings()) === undefined);
+  check('moved to the trash: the status bar says so', /已暂停/.test(manager.statusItem.text), manager.statusItem.text);
+  check('moved to the trash: the files stay', fs.readFileSync(path.join(folder, 'main.tex'), 'utf8') === 'keep me\n');
+  await manager.checkStanding();
+  check('still in the trash: nothing more happens', seen.started === 1 && seen.forgotten === 1);
+
+  seen.standing = 'active';
+  await manager.checkStanding();
+  check('restored: syncing continues by itself', seen.started === 2 && !manager.paused && !LocalReplicaSCMProvider.detached);
+
+  seen.standing = 'archived';
+  await manager.checkStanding();
+  check('archived: syncing pauses too', manager.paused === 'archived' && !manager.sync && LocalReplicaSCMProvider.detached === true);
+  seen.standing = 'active';
+  await manager.checkStanding();
+  check('unarchived: syncing continues', seen.started === 3 && !manager.paused);
+
+  // what cannot be told changes nothing
+  for (const each of ['unknown', 'throws']) {
+    seen.standing = each;
+    await manager.checkStanding();
+    check(`${each}: syncing carries on`, !!manager.sync && !manager.paused && seen.started === 3);
+  }
+  const syncing = manager.sync;
+
+  // a lapsed login
+  seen.standing = 'loggedOut';
+  await manager.checkStanding();
+  check('login expired: syncing is not ended', manager.sync === syncing && manager.folder !== undefined);
+  check('login expired: the status bar says what to do', /登录/.test(manager.statusItem.text), manager.statusItem.text);
+  check('login expired: the link is not marked as ended', JSON.parse(fs.readFileSync(settingsFile, 'utf8')).ended === undefined);
+  manager.renderStatus(syncing.status);
+  check('login expired: a status update does not hide it', /登录/.test(manager.statusItem.text), manager.statusItem.text);
+  seen.standing = 'active';
+  const forgottenBefore = seen.forgotten;
+  await manager.checkStanding();
+  check('logged in again: connects anew, with the new login', seen.started === 4 && seen.forgotten === forgottenBefore + 1);
+
+  // a connection that stopped trying
+  manager.remote = { hasGivenUp: true, dispose() {} };
+  await manager.checkStanding();
+  check('a connection that gave up is started again once the project answers', seen.started === 5, String(seen.started));
+  manager.remote = undefined;
+
+  // the project being gone
+  seen.standing = 'gone';
+  await manager.checkStanding();
+  check('gone: this window lets go', !manager.hasLinkedFolder && !manager.sync);
+  check('gone: the files stay', fs.readFileSync(path.join(folder, 'main.tex'), 'utf8') === 'keep me\n');
+  check('gone: the link is marked as ended, not deleted', JSON.parse(fs.readFileSync(settingsFile, 'utf8')).ended === true);
+  check('gone: an ended folder is not looked for again', (await LocalReplicaSCMProvider.findProjectFolder(vscode.Uri.file(parent))) === undefined);
+  const startedAtEnd = seen.started;
+  await manager.resume();
+  check('gone: a later reopening starts nothing', seen.started === startedAtEnd && !manager.hasLinkedFolder);
+  check('gone: nothing pretends to be connected', !LocalReplicaSCMProvider.detached);
+
+  // a new link next to it, and over it
+  const fresh = make();
+  fresh.manager.confirmLink = async () => true;
+  await fresh.manager.linkProject({ uri: 'overleaf-workshop://www.overleaf.com/Other?user=u&project=p10', label: 'Other' });
+  check('gone: another project can be linked here', fresh.seen.started === 1);
+  fs.rmSync(path.join(parent, 'overleaf-Other'), { recursive: true });
+  LocalReplicaSCMProvider.forgetProjectRoot();
+  const syncRecords = path.join(folder, '.overleaf', 'sync');
+  fs.mkdirSync(syncRecords, { recursive: true });
+  fs.writeFileSync(path.join(syncRecords, 'manifest.json'), JSON.stringify({ version: 1, files: { 'main.tex': { kind: 'doc', hash: 'x', remoteVersion: 'old' } } }));
+  const again = make();
+  again.manager.confirmLink = async () => true;
+  await again.manager.linkProject({ uri: PROJECT, label: 'Paper' });
+  check('a new project of the same name can take over the folder', again.seen.started === 1 && JSON.parse(fs.readFileSync(settingsFile, 'utf8')).ended === undefined);
+  check('without the old project\'s records making its files look deleted', !fs.existsSync(path.join(syncRecords, 'manifest.json')));
+  check('and keeping the files', fs.readFileSync(path.join(folder, 'main.tex'), 'utf8') === 'keep me\n');
+
+  // opening a window onto a project that is away
+  reset();
+  ({ manager, seen } = make());
+  seen.standing = 'trashed';
+  await manager.resume();
+  check('opened while in the trash: never connects', seen.started === 0 && seen.forgotten === 0);
+  check('opened while in the trash: says so', manager.paused === 'trashed' && /已暂停/.test(manager.statusItem.text));
+  check('opened while in the trash: nothing else can connect', (await LocalReplicaSCMProvider.readSettings()) === undefined);
+  seen.standing = 'active';
+  await manager.checkStanding();
+  check('opened while in the trash: starts once restored', seen.started === 1);
+
+  reset();
+  ({ manager, seen } = make());
+  seen.standing = 'gone';
+  await manager.resume();
+  check('opened once gone: never connects, and lets go', seen.started === 0 && !manager.hasLinkedFolder && JSON.parse(fs.readFileSync(settingsFile, 'utf8')).ended === true);
+
+  reset();
+  ({ manager, seen } = make());
+  seen.standing = 'loggedOut';
+  await manager.resume();
+  check('opened logged out: does not try to connect', seen.started === 0 && /登录/.test(manager.statusItem.text));
+  seen.standing = 'active';
+  await manager.checkStanding();
+  check('opened logged out: starts once logged in', seen.started === 1);
+
+  reset();
+  ({ manager, seen } = make());
+  seen.standing = 'unknown';
+  await manager.resume();
+  check('opened offline: tries to connect as usual, offline being no reason to stop', seen.started === 1);
+
+  reset();
+  ({ manager, seen } = make());
+  seen.standing = 'offline';
+  await manager.resume();
+  check('opened with no connection: does not try, which would only fail with messages', seen.started === 0 && /离线/.test(manager.statusItem.text), manager.statusItem.text);
+  await manager.checkStanding();
+  check('opened with no connection: still waiting', seen.started === 0 && manager.hasLinkedFolder);
+  seen.standing = 'active';
+  await manager.checkStanding();
+  check('opened with no connection: starts once Overleaf answers', seen.started === 1);
+
+  // what may connect to the project
+  reset();
+  ({ manager, seen } = make());
+  let answered;
+  manager.provider.projectStanding = () => new Promise((resolve) => { answered = resolve; });
+  const opening = manager.resume();
+  await until(() => answered);
+  let gateOpen;
+  seen.gate.then((open) => { gateOpen = open; });
+  await sleep(50);
+  check('a tab restored while opening waits for the answer', gateOpen === undefined);
+  answered('active');
+  await opening;
+  await sleep(10);
+  check('and may connect once the project is there', gateOpen === true);
+  seen.standing = 'trashed';
+  manager.provider.projectStanding = async () => seen.standing;
+  await manager.checkStanding();
+  check('in the trash: nothing may connect', (await seen.gate) === false);
+  seen.standing = 'gone';
+  await manager.checkStanding();
+  check('gone: nothing may connect', (await seen.gate) === false);
+  const later = make();
+  later.seen.gate = undefined;
+  await later.manager.resume();
+  check('gone, and the window reopened: nothing may connect', (await later.seen.gate) === false);
+
+  // opening from inside
+  reset();
+  fs.mkdirSync(path.join(folder, '.overleaf', 'sync'), { recursive: true });
+  fs.writeFileSync(path.join(folder, '.overleaf', 'sync', 'manifest.json'), '{"version":1,"files":{}}');
+  ({ manager, seen } = make());
+  manager.workspaceFolder = () => vscode.Uri.file(folder);
+  manager.warnAboutOpeningFromInside = async () => { seen.warned = true; };
+  await manager.resume();
+  check('opened from inside: says so', seen.warned === true);
+  check('opened from inside: nothing connects, as the project may be in the trash', LocalReplicaSCMProvider.detached === true && (await LocalReplicaSCMProvider.readSettings()) === undefined);
+  LocalReplicaSCMProvider.detached = false;
+
+  // a connection that never got going
+  reset();
+  ({ manager, seen } = make());
+  delete manager.start;
+  manager.provider.prefetch = async () => { throw new Error('no connection'); };
+  manager.leaveCompilingToOverleaf = async () => {};
+  await manager.resume();
+  check('connecting fails: the connection is thrown away, as it does not retry', seen.forgotten === 1 && !manager.sync, String(seen.forgotten));
+  check('connecting fails: the status bar says offline', /离线/.test(manager.statusItem.text), manager.statusItem.text);
+  check('connecting fails: this window keeps looking after the folder', manager.hasLinkedFolder);
+
+  // the folder going while connecting
+  reset();
+  ({ manager, seen } = make());
+  delete manager.start;
+  manager.provider.prefetch = async () => ({ init: async () => { fs.rmSync(folder, { recursive: true, force: true }); } });
+  manager.leaveCompilingToOverleaf = async () => {};
+  await manager.resume();
+  check('the folder deleted while connecting: it is not brought back', !fs.existsSync(folder), fs.existsSync(folder) ? fs.readdirSync(folder).join() : '');
+  check('the folder deleted while connecting: syncing does not start', !manager.sync);
+
+  // sending what is pending before the project goes away
+  const realWarning = vscode.window.showWarningMessage;
+  const warnings = [];
+  let warningAnswer;
+  vscode.window.showWarningMessage = async (message) => { warnings.push(message); return warningAnswer; };
+  reset();
+  ({ manager, seen } = make());
+  await manager.resume();
+  const status = { connected: true, conflicts: [], failed: [], refused: [], pending: 0 };
+  let flushed = 0;
+  manager.sync = { dispose() {}, stop: async () => {}, flush: async () => { flushed++; }, status };
+  check('leaving with everything sent: no question', (await manager.sendBeforeLeaving('p9')) === true && warnings.length === 0 && flushed === 1);
+  check('leaving another project: not this one\'s concern', (await manager.sendBeforeLeaving('other')) === true && flushed === 1);
+  status.connected = false;
+  status.pending = 2;
+  check('leaving with no connection: asks, and no answer means stay', (await manager.sendBeforeLeaving('p9')) === false && warnings.length === 1, JSON.stringify(warnings));
+  warningAnswer = '继续';
+  check('leaving with no connection: going on is allowed', (await manager.sendBeforeLeaving('p9')) === true);
+  status.connected = true;
+  status.pending = 0;
+  status.failed = ['main.tex'];
+  warnings.length = 0;
+  await manager.sendBeforeLeaving('p9');
+  check('leaving with a file not sent: names it', warnings.length === 1 && warnings[0].includes('main.tex'), JSON.stringify(warnings));
+
+  // emptying the project asks in its own way, with keeping the files as the default
+  const shown = [];
+  vscode.window.showWarningMessage = async (message, options, ...items) => { shown.push({ message, modal: options?.modal, items }); return shown.answer; };
+  manager.remote = { list: async () => [{ path: 'a.tex' }, { path: 'b.tex' }], dispose() {} };
+  shown.answer = undefined;
+  check('deleting everything: dismissing keeps the files', (await manager.confirmRemoteDelete(['a.tex', 'b.tex'])) === false);
+  check('deleting everything: says it empties the project', /清空线上项目/.test(shown[0].message) && shown[0].modal === true, shown[0].message);
+  check('deleting everything: the default button keeps the files', shown[0].items[0] === '恢复到本地' && shown[0].items[1] === '清空线上项目', JSON.stringify(shown[0].items));
+  shown.answer = '恢复到本地';
+  check('deleting everything: keeping is keeping', (await manager.confirmRemoteDelete(['a.tex', 'b.tex'])) === false);
+  shown.answer = '清空线上项目';
+  check('deleting everything: it can be done', (await manager.confirmRemoteDelete(['a.tex', 'b.tex'])) === true);
+  shown.length = 0;
+  shown.answer = '从 Overleaf 删除';
+  check('deleting some: the plain question', (await manager.confirmRemoteDelete(['a.tex'])) === true && !/清空/.test(shown[0].message), shown[0].message);
+  vscode.window.showWarningMessage = realWarning;
+
+  // a check asked for while one is under way is not lost
+  reset();
+  ({ manager, seen } = make());
+  await manager.resume();
+  let release;
+  const realStanding = manager.provider.projectStanding;
+  manager.provider.projectStanding = () => new Promise((resolve) => { release = () => resolve('active'); });
+  const first = manager.checkStanding();
+  await until(() => release);
+  manager.provider.projectStanding = async () => 'trashed';
+  manager.checkStanding();
+  release();
+  await first;
+  check('a check asked for during another still happens', manager.paused === 'trashed');
+  manager.provider.projectStanding = realStanding;
+
+  // a project folder opened directly, once ended, is an ordinary folder there too
+  const rootSettings = path.join(workspaceRoot(), '.overleaf', 'settings.json');
+  fs.mkdirSync(path.dirname(rootSettings), { recursive: true });
+  fs.writeFileSync(rootSettings, JSON.stringify({ uri: PROJECT, ended: true }));
+  LocalReplicaSCMProvider.forgetProjectRoot();
+  check('an ended link in the open folder reads as no link', (await LocalReplicaSCMProvider.readSettings()) === undefined);
+  fs.rmSync(path.dirname(rootSettings), { recursive: true, force: true });
+  LocalReplicaSCMProvider.forgetProjectRoot();
+
+  // the local folder going, and coming back
+  reset();
+  ({ manager, seen } = make());
+  await manager.resume();
+  const moved = `${parent}-moved`;
+  fs.rmSync(moved, { recursive: true, force: true });
+  fs.renameSync(parent, moved);
+  fs.mkdirSync(parent);
+  manager.lastStandingCheck = Date.now();
+  await manager.tick();
+  check('folder deleted: this window lets go', !manager.hasLinkedFolder && !manager.sync);
+  check('folder deleted: the connection is closed', seen.forgotten === 1);
+  check('folder deleted: nothing is recreated', fs.readdirSync(parent).length === 0, fs.readdirSync(parent).join());
+  check('folder deleted: not paused or waiting', !LocalReplicaSCMProvider.detached);
+  fs.rmSync(parent, { recursive: true });
+  fs.renameSync(moved, parent);
+  manager.lastLookForLink = 0;
+  await manager.tick();
+  check('folder restored from the recycle bin: syncing resumes', seen.started === 2 && manager.hasLinkedFolder, String(seen.started));
+
+  // a passing failure to look is not the folder being gone
+  const realStat = Object.getOwnPropertyDescriptor(manager, 'exists');
+  check('setup: exists is on the prototype', realStat === undefined);
+  check('a definite not-found reads as missing', (await manager.exists(vscode.Uri.file(path.join(parent, 'nothing-here')))) === false);
+  manager.stopTicking();
+
+  // paused, and the folder is deleted
+  reset();
+  ({ manager, seen } = make());
+  seen.standing = 'trashed';
+  await manager.resume();
+  fs.rmSync(folder, { recursive: true });
+  await manager.tick();
+  check('folder deleted while paused: this window lets go', !manager.hasLinkedFolder && !manager.paused && !LocalReplicaSCMProvider.detached);
+  check('folder deleted while paused: it stays deleted', !fs.existsSync(folder));
+
+  fs.rmSync(parent, { recursive: true, force: true });
+  LocalReplicaSCMProvider.detached = false;
+  LocalReplicaSCMProvider.forgetProjectRoot();
+}
+
+/** How the answers from the server are read. Everything uncertain has to come out as "cannot tell". */
+async function testProjectStanding(RemoteFileSystemProvider, BaseAPI) {
+  const uri = vscode.Uri.parse('overleaf-workshop://www.overleaf.com/Paper?user=me&project=p1');
+  const persists = (login) => ({ 'www.overleaf.com': { name: 'www.overleaf.com', url: 'https://www.overleaf.com/', login } });
+  const standing = async ({ list, fallback, entities, login = { userId: 'me', identity: {} } }) => {
+    const saved = { ...BaseAPI.prototype };
+    const calls = [];
+    BaseAPI.prototype.getProjectsJson = async () => { calls.push('list'); return list; };
+    BaseAPI.prototype.userProjectsJson = async () => { calls.push('fallback'); return fallback ?? { type: 'error', message: '404: ' }; };
+    BaseAPI.prototype.projectEntitiesJson = async () => { calls.push('entities'); return entities ?? { type: 'success', entities: [] }; };
+    const provider = Object.create(RemoteFileSystemProvider.prototype);
+    provider.context = { globalState: { get: () => persists(login), update: async () => {} } };
+    try {
+      return await provider.projectStanding(uri);
+    } finally {
+      Object.assign(BaseAPI.prototype, { getProjectsJson: saved.getProjectsJson, userProjectsJson: saved.userProjectsJson, projectEntitiesJson: saved.projectEntitiesJson });
+    }
+  };
+  const listing = (...projects) => ({ type: 'success', projects });
+  const other = { id: 'p2' };
+
+  check('in the list: active', await standing({ list: listing({ id: 'p1' }, other) }) === 'active');
+  check('flagged trashed', await standing({ list: listing({ id: 'p1', trashed: true }) }) === 'trashed');
+  check('flagged archived', await standing({ list: listing({ id: 'p1', archived: true }) }) === 'archived');
+  check('absent and refused: gone', await standing({ list: listing(other), entities: { type: 'error', message: '403: Forbidden' } }) === 'gone');
+  check('absent and not found: gone', await standing({ list: listing(other), entities: { type: 'error', message: '404: Not found' } }) === 'gone');
+  check('absent but still readable: cannot tell', await standing({ list: listing(other) }) === 'unknown');
+  check('absent and a server error: cannot tell', await standing({ list: listing(other), entities: { type: 'error', message: '500: oops' } }) === 'unknown');
+  check('absent and offline: cannot tell', await standing({ list: listing(other), entities: { type: 'error', message: 'fetch failed' } }) === 'unknown');
+  check('an empty list alone is not enough', await standing({ list: listing() }) === 'unknown');
+  check('no connection: says so', await standing({ list: { type: 'error', message: 'fetch failed' }, fallback: { type: 'error', message: 'fetch failed' } }) === 'offline');
+  check('a server error: cannot tell', await standing({ list: { type: 'error', message: '500: oops' } }) === 'unknown');
+  check('the older list works too', await standing({ list: { type: 'error', message: '404: ' }, fallback: listing({ id: 'p1' }) }) === 'active');
+  check('the older list leaves out the trash, which must not read as gone', await standing({ list: { type: 'error', message: '404: ' }, fallback: listing(other) }) === 'unknown');
+  check('a redirect to log in: logged out', await standing({ list: { type: 'error', message: '302: Found' } }) === 'loggedOut');
+  check('a redirect while checking the project: logged out', await standing({ list: listing(other), entities: { type: 'error', message: '302: Found' } }) === 'loggedOut');
+  check('no login: logged out', await standing({ list: listing(), login: null }) === 'loggedOut');
+  check('another account logged in: logged out, not gone', await standing({ list: listing(other), login: { userId: 'someone-else', identity: {} }, entities: { type: 'error', message: '403: ' } }) === 'loggedOut');
+
+  // the gate in front of connecting
+  const gated = Object.create(RemoteFileSystemProvider.prototype);
+  Object.assign(gated, { context: {}, vfss: { [uri.query]: { itIs: 'the connection' } }, gates: new Map() });
+  check('with no gate, connecting goes ahead', (await gated.prefetch(uri)).itIs === 'the connection');
+  gated.setGate(uri, Promise.resolve(false));
+  const refused = await gated.prefetch(uri).then(() => false, () => true);
+  check('with a closed gate, it is refused', refused);
+  gated.setGate(uri, Promise.resolve(true));
+  check('with an open gate, it goes ahead', (await gated.prefetch(uri)).itIs === 'the connection');
+}
+
 exports.run = async function () {
   try {
     await testProjectFolder(require(path.join(out, 'scm', 'localReplicaSCM.js')).LocalReplicaSCMProvider);
@@ -1778,6 +2623,11 @@ exports.run = async function () {
     await testComments(require(path.join(out, 'sync', 'comments.js')));
     await testSync(FolderSync);
     await testSafety(FolderSync, merge);
+    await testFolders(FolderSync);
+    await testOnlineRename(FolderSync);
+    await testFolderDeleted(FolderSync);
+    await testStanding(require(path.join(out, 'sync', 'index.js')).FolderSyncManager, require(path.join(out, 'scm', 'localReplicaSCM.js')).LocalReplicaSCMProvider);
+    await testProjectStanding(require(path.join(out, 'core', 'remoteFileSystemProvider.js')).RemoteFileSystemProvider, require(path.join(out, 'api', 'base.js')).BaseAPI);
     await testConnection(require(path.join(out, 'api', 'socketio.js')).SocketIOAPI);
   } catch (e) {
     results.push(`ERROR ${e && e.stack}`);

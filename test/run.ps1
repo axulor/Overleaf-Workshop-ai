@@ -17,7 +17,8 @@ foreach ($suite in 'compile-tests.js', 'sync-tests.js', 'activation-tests.js') {
   }
   New-Item -ItemType Directory -Force -Path (Join-Path $run 'user-data\User'), (Join-Path $run 'extensions'), (Join-Path $run 'workspace') | Out-Null
   $results = Join-Path $run 'results.txt'
-  Remove-Item -LiteralPath $results -ErrorAction SilentlyContinue
+  $progress = Join-Path $run 'progress.txt'
+  Remove-Item -LiteralPath $results, $progress -ErrorAction SilentlyContinue
   if ($suite -eq 'activation-tests.js') {
     $linked = Join-Path $run 'workspace\overleaf-My Paper\.overleaf'
     New-Item -ItemType Directory -Force -Path $linked | Out-Null
@@ -33,11 +34,16 @@ foreach ($suite in 'compile-tests.js', 'sync-tests.js', 'activation-tests.js') {
   )
   $process = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru
   $clock = [Diagnostics.Stopwatch]::StartNew()
-  while (-not (Test-Path -LiteralPath $results) -and $clock.Elapsed.TotalSeconds -lt 240) { Start-Sleep -Seconds 1 }
+  while (-not (Test-Path -LiteralPath $results) -and $clock.Elapsed.TotalSeconds -lt 540) { Start-Sleep -Seconds 1 }
   Start-Sleep -Seconds 2
   if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
 
-  if (-not (Test-Path -LiteralPath $results)) { 'ERROR no results: the test run timed out'; $failed = $true; continue }
+  if (-not (Test-Path -LiteralPath $results)) {
+    'ERROR no results: the test run timed out. It had got as far as:'
+    Get-Content -LiteralPath $progress -Encoding UTF8 -Tail 5 -ErrorAction SilentlyContinue
+    $failed = $true
+    continue
+  }
   $rows = @(Get-Content -LiteralPath $results -Encoding UTF8)
   $rows | Where-Object { $_ -match '^(FAIL|ERROR)|^\s+at ' }
   $pass = @($rows | Where-Object { $_ -like 'PASS*' }).Count

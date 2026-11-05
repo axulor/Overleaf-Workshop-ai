@@ -132,13 +132,13 @@ function describeComment(comment: PlacedComment) {
     return [`### ${where}`, '', ...quote.split('\n').map((line) => `> ${line}`), '', ...messages, ''];
 }
 
-function renderCommentsFile(projectName: string, comments: PlacedComment[]) {
+function renderCommentsFile(projectName: string, comments: PlacedComment[], outOfDate?: string) {
     const open = comments.filter((comment) => !comment.resolved);
     const resolved = comments.filter((comment) => comment.resolved);
     const lines = [
         `# Overleaf comments: ${projectName}`,
         '',
-        'Kept up to date from the online project. Changing this file changes nothing on Overleaf.',
+        outOfDate ?? 'Kept up to date from the online project. Changing this file changes nothing on Overleaf.',
         '',
         `## Open (${open.length})`,
         '',
@@ -193,6 +193,7 @@ export class ProjectComments implements vscode.Disposable {
     private comments: PlacedComment[] = [];
     private me?: {id: string, name: string};
     private written?: string;
+    private outOfDate?: string;
     private refreshTimer?: NodeJS.Timeout;
     private relocateTimer?: NodeJS.Timeout;
     private changedQuoteTimer?: NodeJS.Timeout;
@@ -616,9 +617,22 @@ export class ProjectComments implements vscode.Disposable {
         }
     }
 
+    /** Says in the plain file that it is no longer being kept up to date, as a tool reading it could not tell. */
+    async markOutOfDate(reason: string | undefined) {
+        this.outOfDate = reason;
+        await this.writeFile().catch(() => {});
+    }
+
     private async writeFile() {
-        const content = renderCommentsFile(this.projectName, this.comments);
+        if (this.disposed) { return; }
+        const content = renderCommentsFile(this.projectName, this.comments, this.outOfDate);
         if (content === this.written) { return; }
+        // Writing creates whatever folders are missing, which would bring back a project folder just deleted.
+        try {
+            await vscode.workspace.fs.stat(vscode.Uri.joinPath(this.outputFolder, '..'));
+        } catch {
+            return;
+        }
         await vscode.workspace.fs.createDirectory(this.outputFolder);
         // Comments are collaborators' words, which should not reach a repository the folder happens to be in.
         const ignore = vscode.Uri.joinPath(this.outputFolder, '.gitignore');

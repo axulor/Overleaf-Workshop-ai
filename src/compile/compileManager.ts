@@ -168,6 +168,7 @@ export class CompileManager {
         this.vfsm = vfsm;
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1);
         this.status.command = `${ROOT_NAME}.compilerManager.settings`;
+        CompileManager.hideStatus = () => this.status.hide();
         this.diagnosticProvider = new CompileDiagnosticProvider(vfsm);
         // listen pdf open event
         EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
@@ -196,6 +197,9 @@ export class CompileManager {
         // otherwise return undefined
         return undefined;
     }
+
+    /** Set on creation, for when the project stops being there to compile. */
+    static hideStatus?: () => void;
 
     async update(status: 'success'|'hasErrors'|'compiling'|'failed'|'alert') {
         const uri = await CompileManager.check();

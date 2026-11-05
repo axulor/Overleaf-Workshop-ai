@@ -14,6 +14,7 @@ export type Events = {
     'projectJoinedEvent': {projectId:string},
     'projectDisconnectedEvent': {projectId:string},
     'commentsChangedEvent': {projectId:string},
+    'projectStandingChangedEvent': {projectId?:string},
 };
 
 export class EventBus {

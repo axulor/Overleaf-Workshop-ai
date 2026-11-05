@@ -135,14 +135,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         for (const name of folders) {
             const folder = vscode.Uri.joinPath(parent, name);
             try {
-                await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder, '.overleaf/settings.json'));
-                return folder;
+                const content = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder, '.overleaf/settings.json'));
+                // A folder whose project no longer exists is an ordinary folder, and no reason to refuse a new link.
+                if (JSON.parse(new TextDecoder().decode(content)).ended !== true) { return folder; }
             } catch (error) {
                 // not this one
             }
         }
         return undefined;
     }
+
+    /**
+     * While a synced project is paused or being checked, its folder must look like any other. Otherwise compile status,
+     * cursors and the like would connect to the project, and through that bring it back to life.
+     */
+    public static detached = false;
 
     private static projectRootCache?: {workspaceRoot: string, projectRoot: vscode.Uri, time: number};
 
@@ -165,7 +172,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     public static async pathToUri(path: string): Promise<vscode.Uri | undefined> {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
-        if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
+        if (LocalReplicaSCMProvider.detached || workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
 
         const projectRoot = await LocalReplicaSCMProvider.projectRoot(workspaceRoot);
         const settingUri = vscode.Uri.joinPath(projectRoot, '.overleaf/settings.json');
@@ -179,7 +186,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     public static async uriToPath(uri: vscode.Uri): Promise<string | undefined> {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
-        if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
+        if (LocalReplicaSCMProvider.detached || workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
 
         const projectRoot = await LocalReplicaSCMProvider.projectRoot(workspaceRoot);
         const settingUri = vscode.Uri.joinPath(projectRoot, '.overleaf/settings.json');
@@ -196,14 +203,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     public static async readSettings(): Promise<any | undefined> {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
-        if (vscode.workspace.workspaceFolders?.length!==1 || workspaceRoot?.scheme!=='file') { return undefined; }
+        if (LocalReplicaSCMProvider.detached || vscode.workspace.workspaceFolders?.length!==1 || workspaceRoot?.scheme!=='file') { return undefined; }
 
         const projectRoot = await LocalReplicaSCMProvider.projectRoot(workspaceRoot);
         const settingUri = vscode.Uri.joinPath(projectRoot, '.overleaf/settings.json');
         try {
             await vscode.workspace.fs.stat(settingUri);
             const content = await vscode.workspace.fs.readFile(settingUri);
-            return JSON.parse( new TextDecoder().decode(content) );
+            const settings = JSON.parse( new TextDecoder().decode(content) );
+            return settings.ended===true ? undefined : settings; // an ordinary folder now
         } catch (error) {
             return undefined;
         }

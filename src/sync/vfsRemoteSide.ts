@@ -85,6 +85,29 @@ export class VfsRemoteSide implements RemoteSide, CommentSource, vscode.Disposab
         return this.vfs.replaceDocContent(this.uri(path), text, basedOn);
     }
 
+    async listFolders() {
+        await this.vfs.init();
+        return this.vfs.walk((entity) => entity._type === 'folder').map(({ path }) => path.replace(/^\//, ''))
+            .filter((path) => path !== '' && !path.split('/').includes('..'));
+    }
+
+    async createFolder(path: string) {
+        await this.ensureFolder(`${path}/`);
+        if (!(await this.listFolders()).includes(path)) { throw new Error(`Overleaf did not create the folder ${path}.`); }
+    }
+
+    async removeFolder(path: string) {
+        // Deleting a folder takes what is in it, so the server is asked, in case word of a new file has not reached here yet.
+        if (!await this.vfs.isFolderEmptyOnServer(path)) { throw new Error(`The folder ${path} is not empty online.`); }
+        await this.vfs.remove(this.uri(path), true);
+        if ((await this.listFolders()).includes(path)) { throw new Error(`Overleaf did not delete the folder ${path}.`); }
+    }
+
+    /** Whether the connection has stopped trying, as after an expired login. */
+    get hasGivenUp() {
+        return this.vfs.hasGivenUp;
+    }
+
     async rename(from: string, to: string) {
         await this.ensureFolder(to);
         await this.vfs.rename(this.uri(from), this.uri(to), false);

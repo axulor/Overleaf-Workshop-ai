@@ -1,3 +1,4 @@
+import { EventBus } from '../utils/eventBus';
 import * as vscode from 'vscode';
 import { ROOT_NAME } from '../consts';
 import { ProjectTagsResponseSchema } from '../api/base';
@@ -225,6 +226,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                 )
                 .then(success => {
                     if (success) {
+                        EventBus.fire('projectStandingChangedEvent', {});
                         this.refresh();
                     } else {
                         vscode.window.showErrorMessage( vscode.l10n.t('Login failed.') );
@@ -243,6 +245,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                 )
                 .then(success => {
                     if (success) {
+                        EventBus.fire('projectStandingChangedEvent', {});
                         this.refresh();
                     } else {
                         vscode.window.showErrorMessage( vscode.l10n.t('Login failed.') );
@@ -379,19 +382,28 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         });
     }
 
+    /** Set by whatever syncs a project: it gets the chance to send what is pending, or to say the project should stay. */
+    static beforeLeavingProject?: (projectId:string) => Promise<boolean>;
+
+    private static async readyToLeave(projectId:string) {
+        return await ProjectManagerProvider.beforeLeavingProject?.(projectId) ?? true;
+    }
+
     deleteProject(project: ProjectItem) {
         vscode.window.showWarningMessage(vscode.l10n.t('Permanently delete project "{label}" ?', {label:project.label}), "Yes", "No")
         .then((answer) => {
             if (answer === "Yes") {
-                GlobalStateManager.authenticate(this.context, project.parent.name)
+                ProjectManagerProvider.readyToLeave(project.pid)
+                .then(ready => ready ? GlobalStateManager.authenticate(this.context, project.parent.name) : Promise.reject())
                 .then(identity => project.api.deleteProject(identity, project.pid))
                 .then(res => {
                     if (res.type==='success') {
+                        EventBus.fire('projectStandingChangedEvent', {projectId: project.pid});
                         this.refresh();
                     } else {
                         vscode.window.showErrorMessage(res.message);
                     }
-                });
+                }, () => {});
             }
         });
     }
@@ -400,15 +412,17 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         vscode.window.showWarningMessage(vscode.l10n.t('Archive project "{label}" ?', {label:project.label}), "Yes", "No")
         .then((answer) => {
             if (answer === "Yes") {
-                GlobalStateManager.authenticate(this.context, project.parent.name)
+                ProjectManagerProvider.readyToLeave(project.pid)
+                .then(ready => ready ? GlobalStateManager.authenticate(this.context, project.parent.name) : Promise.reject())
                 .then(identity => project.api.archiveProject(identity, project.pid))
                 .then(res => {
                     if (res.type==='success') {
+                        EventBus.fire('projectStandingChangedEvent', {projectId: project.pid});
                         this.refresh();
                     } else {
                         vscode.window.showErrorMessage(res.message);
                     }
-                });
+                }, () => {});
             }
         });
     }
@@ -418,6 +432,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         .then(identity => project.api.unarchiveProject(identity, project.pid))
         .then(res => {
             if (res.type==='success') {
+                EventBus.fire('projectStandingChangedEvent', {projectId: project.pid});
                 this.refresh();
             } else {
                 vscode.window.showErrorMessage(res.message);
@@ -429,15 +444,17 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         vscode.window.showWarningMessage(vscode.l10n.t('Move project "{label}" to trash ?', {label:project.label}), "Yes", "No")
         .then((answer) => {
             if (answer === "Yes") {
-                GlobalStateManager.authenticate(this.context, project.parent.name)
+                ProjectManagerProvider.readyToLeave(project.pid)
+                .then(ready => ready ? GlobalStateManager.authenticate(this.context, project.parent.name) : Promise.reject())
                 .then(identity => project.api.trashProject(identity, project.pid))
                 .then(res => {
                     if (res.type==='success') {
+                        EventBus.fire('projectStandingChangedEvent', {projectId: project.pid});
                         this.refresh();
                     } else {
                         vscode.window.showErrorMessage(res.message);
                     }
-                });
+                }, () => {});
             }
         });
     }
@@ -447,6 +464,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         .then(identity => project.api.untrashProject(identity, project.pid))
         .then(res => {
             if (res.type==='success') {
+                EventBus.fire('projectStandingChangedEvent', {projectId: project.pid});
                 this.refresh();
             } else {
                 vscode.window.showErrorMessage(res.message);

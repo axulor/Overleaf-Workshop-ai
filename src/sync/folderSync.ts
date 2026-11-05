@@ -26,6 +26,10 @@ export interface RemoteSide {
     /** Creates a file or document, or replaces a non-text file. */
     writeFile(path: string, content: Uint8Array): Promise<void>;
     remove(path: string): Promise<void>;
+    listFolders(): Promise<string[]>;
+    /** Creates a folder and any folders above it. */
+    createFolder(path: string): Promise<void>;
+    removeFolder(path: string): Promise<void>;
     /** Keeps the file's identity, and so the comments on a document. Only within a folder, or to another folder under the same name. */
     rename(from: string, to: string): Promise<void>;
     /** Fires a path when one file's content changed, or undefined when files may have appeared, gone or moved. */
@@ -40,6 +44,10 @@ export interface FolderSyncOptions {
     onConflict?(path: string, reason: ConflictReason): void;
     /** A file that will not sync until someone changes it. */
     onProblem?(path: string, problem: SyncProblem): void;
+    /** Files deleted online, whose local copies went to the trash folder. */
+    onOnlineDelete?(paths: string[]): void;
+    /** Whether the folder is still linked. Once it is not, the engine must not touch anything, online or local. */
+    stillLinked?(): Promise<boolean>;
     log?(message: string): void;
     ignorePatterns?: string[];
     /** How long a path must stay quiet before it is synced. */
@@ -73,6 +81,8 @@ interface BaseEntry {
 interface Manifest {
     version: 1;
     files: { [path: string]: BaseEntry };
+    /** The folders both sides agreed on, which tells a folder deleted on one side from one new on the other. */
+    folders?: string[];
     /** Files waiting for the user to choose. After a reload, nothing else would show that they must not be sent. */
     held?: string[];
 }
@@ -106,6 +116,11 @@ const MANIFEST_READ_RETRY_MS = 100;
 const DELETE_PROMPT_DELAY_MS = 500;
 const EMPTY_FILE_RECHECK_MS = 500;
 const FULL_SCAN_DELAY_MS = 300;
+const ONLINE_DELETE_NOTICE_MS = 800;
+
+/** Where two spellings differing only in case are one file, so one of them being found says nothing about the other. */
+const CASE_INSENSITIVE_DISK = process.platform === 'win32' || process.platform === 'darwin';
+const isSameFileHere = (a: string, b: string) => CASE_INSENSITIVE_DISK && a.toLowerCase() === b.toLowerCase();
 const EMPTY_HASH = fingerprint('');
 /** How long the edit that arrived last is remembered, to recognize a tool writing a file it read some time ago. */
 const LAST_RECEIVED_MS = 5 * 60 * 1000;
@@ -113,7 +128,7 @@ const LAST_RECEIVED_MS = 5 * 60 * 1000;
 const JUST_MISSED_MS = 1000;
 const LOCAL_WRITE_RETRIES = 100;
 
-function isFileNotFound(error: unknown) {
+export function isFileNotFound(error: unknown) {
     return error instanceof vscode.FileSystemError && error.code === 'FileNotFound';
 }
 
@@ -152,6 +167,14 @@ export class FolderSync implements vscode.Disposable {
     /** Files held back as probably written from an old copy, until the user chooses. */
     private readonly heldCopies = new Set<string>();
     private readonly localWriteRetries = new Map<string, number>();
+    /** Being deleted online. Until that has happened the file still looks like one deleted here and not yet asked about. */
+    private readonly removingOnline = new Set<string>();
+    private onlineDeletes: string[] = [];
+    private onlineDeleteTimer?: NodeJS.Timeout;
+    private foldersDirty = false;
+    /** A deletion was turned down, so the empty folders that went with the files come back too. */
+    private restoringFolders = false;
+    private stopping = false;
     private manifestChanged = false;
     private retryMs = RETRY_MS;
     private deletePromptTimer?: NodeJS.Timeout;
@@ -219,7 +242,7 @@ export class FolderSync implements vscode.Disposable {
     dispose() {
         this.disposed = true;
         for (const timer of [...this.timers.values(), ...this.saveTimers.values()]) { clearTimeout(timer); }
-        for (const timer of [this.deletePromptTimer, this.retryTimer, this.scanTimer]) {
+        for (const timer of [this.deletePromptTimer, this.retryTimer, this.scanTimer, this.onlineDeleteTimer]) {
             if (timer) { clearTimeout(timer); }
         }
         this.disposables.forEach((disposable) => disposable.dispose());
@@ -227,6 +250,7 @@ export class FolderSync implements vscode.Disposable {
 
     /** Stops after finishing what is in progress, so that another engine can safely take over the folder. */
     async stop() {
+        this.stopping = true;
         this.dispose();
         await this.scanning;
         while (this.loop) { await this.loop; }
@@ -363,6 +387,7 @@ export class FolderSync implements vscode.Disposable {
         for (const known of Object.keys(this.manifest.files)) {
             if (known.startsWith(`${path}/`)) { this.schedule(known); }
         }
+        if (!this.manifest.files[path]) { this.scheduleFullScan(); } // it may have been a folder
     }
 
     /** Typing in the editor reaches the disk, and so Overleaf, after a short pause, with no need to save. */
@@ -428,8 +453,11 @@ export class FolderSync implements vscode.Disposable {
                 (await this.remote.list()).forEach((entry) => paths.add(entry.path));
                 (await this.listLocal()).forEach((path) => paths.add(path));
                 paths.forEach((path) => { if (!this.isIgnored(path)) { this.dirty.add(path); } });
+                this.foldersDirty = true;
                 this.kick();
             } catch (error) {
+                // With the folder gone there is nothing to retry, and the owner of this engine will stop it.
+                if (!await this.isStillLinked()) { return; }
                 this.report(`Could not list the project: ${error}`);
                 this.retryLater();
             } finally {
@@ -451,8 +479,16 @@ export class FolderSync implements vscode.Disposable {
 
     // ---- the work queue ----
 
+    /**
+     * After the files, as a folder emptied by them may then go, and after any open question, whose answer may bring a
+     * folder back. Whatever they are waiting for starts the loop again when it is done.
+     */
+    private foldersCanGo() {
+        return this.foldersDirty && this.dirty.size === 0 && this.timers.size === 0 && this.pendingDeletes.size === 0;
+    }
+
     private kick() {
-        if (this.loop || this.disposed || !this.connected || this.dirty.size === 0) {
+        if (this.loop || this.disposed || !this.connected || (this.dirty.size === 0 && !this.foldersCanGo())) {
             this.fireStatus();
             return;
         }
@@ -483,22 +519,133 @@ export class FolderSync implements vscode.Disposable {
             this.fireStatus();
         }
         if (this.failed.size === 0) { this.retryMs = RETRY_MS; }
+        if (this.foldersCanGo() && !this.disposed && this.connected) {
+            this.foldersDirty = false;
+            try {
+                await this.reconcileFolders();
+                await this.saveManifest();
+            } catch (error) {
+                this.report(`Could not sync the folders: ${error}`);
+            }
+        }
+    }
+
+    private async isStillLinked() {
+        return this.options.stillLinked ? await this.options.stillLinked() : true;
+    }
+
+    /**
+     * Folders exist in their own right, as on Overleaf's page: an empty one syncs, and one whose files have all gone
+     * goes too. A folder is only ever removed when empty, so this cannot take any file with it. Removing a file
+     * is what asks first, and a folder that was deleted with files in it goes after they have.
+     */
+    private async reconcileFolders() {
+        if (!await this.isStillLinked()) { return; }
+        const base = new Set(this.manifest.folders ?? []);
+        const local = new Set(await this.listLocalFolders());
+        const online = new Set((await this.remote.listFolders()).filter((path) => !this.isIgnored(path)));
+        const agreed = new Set<string>();
+        const restoring = this.restoringFolders;
+        this.restoringFolders = false;
+        // One folder that cannot be handled must not stop the others. It is tried again on the next look.
+        const attempt = async (path: string, action: () => Thenable<void> | Promise<void>) => {
+            try {
+                await action();
+                return true;
+            } catch (error) {
+                this.report(`Could not sync the folder ${path}: ${error instanceof Error ? error.message : error}`);
+                if (base.has(path)) { agreed.add(path); }
+                return false;
+            }
+        };
+        // A folder holding only what does not sync, like build output, stays local. An empty one is meant to be there.
+        const syncable = await this.listLocal();
+        const worthCreating = new Set<string>();
+        for (const path of [...local].sort((a, b) => b.length - a.length)) {
+            const isEmpty = (await vscode.workspace.fs.readDirectory(this.toUri(path))).length === 0;
+            if (isEmpty || syncable.some((each) => each.startsWith(`${path}/`)) || [...worthCreating].some((each) => each.startsWith(`${path}/`))) {
+                worthCreating.add(path);
+            }
+        }
+        // Asked at the last moment, as someone online may have just added to it, and deleting takes what is inside.
+        const hasOnlineContent = async (path: string) => (await this.remote.list()).some((entry) => entry.path.startsWith(`${path}/`))
+            || (await this.remote.listFolders()).some((other) => other.startsWith(`${path}/`));
+
+        // Deleting comes first and deepest first, so that a parent is empty by the time it is its turn.
+        const everyFolder = [...new Set([...base, ...local, ...online])].sort((a, b) => b.length - a.length);
+        for (const path of everyFolder) {
+            if (local.has(path) && online.has(path)) {
+                agreed.add(path);
+            } else if (local.has(path) && base.has(path)) {
+                try {
+                    await vscode.workspace.fs.delete(this.toUri(path), { recursive: false });
+                    local.delete(path);
+                } catch {
+                    agreed.add(path); // it still has local files in it, which will bring it back online
+                }
+            } else if (online.has(path) && base.has(path)) {
+                if (restoring) {
+                    if (await attempt(path, () => vscode.workspace.fs.createDirectory(this.toUri(path)))) { agreed.add(path); }
+                } else if (await hasOnlineContent(path)) {
+                    agreed.add(path);
+                } else if (await attempt(path, () => this.remote.removeFolder(path))) {
+                    online.delete(path);
+                }
+            }
+        }
+        for (const path of everyFolder.reverse()) {
+            if (local.has(path) && !online.has(path) && !base.has(path) && worthCreating.has(path)) {
+                if (await attempt(path, () => this.remote.createFolder(path))) {
+                    online.add(path);
+                    agreed.add(path);
+                }
+            } else if (online.has(path) && !local.has(path) && !base.has(path)) {
+                if (await attempt(path, () => vscode.workspace.fs.createDirectory(this.toUri(path)))) {
+                    local.add(path);
+                    agreed.add(path);
+                }
+            }
+        }
+        const sorted = [...agreed].sort();
+        if (JSON.stringify(sorted) !== JSON.stringify(this.manifest.folders ?? [])) {
+            this.manifest.folders = sorted;
+            this.manifestChanged = true;
+        }
+    }
+
+    private async listLocalFolders(folder: string = ''): Promise<string[]> {
+        const results: string[] = [];
+        const uri = folder ? vscode.Uri.joinPath(this.root, folder) : this.root;
+        for (const [name, type] of await vscode.workspace.fs.readDirectory(uri)) {
+            const path = folder ? `${folder}/${name}` : name;
+            if (this.isIgnored(path) || type & vscode.FileType.SymbolicLink || !(type & vscode.FileType.Directory)) { continue; }
+            results.push(path, ...await this.listLocalFolders(path));
+        }
+        return results;
     }
 
     // ---- syncing one file ----
 
     private async reconcile(path: string) {
-        if (this.pendingDeletes.has(path) || this.renaming.has(path)) { return; }
+        if (this.pendingDeletes.has(path) || this.removingOnline.has(path) || this.renaming.has(path)) { return; }
 
         const entry = await this.findRemote(path);
         const base = this.manifest.files[path];
         const fromEditor = !!this.openDocument(path)?.isDirty || this.editedHere.has(path);
         const bytes = await this.readLocal(path);
         this.editedHere.delete(path);
+        // A file missing because the whole folder went says nothing about the online file.
+        if (bytes === undefined && !await this.isStillLinked()) { return; }
         if (!entry && !base && bytes === undefined) {
             this.clearConflict(path);
             return;
         }
+        if (await this.followOnlineRename(path, entry, base, bytes)) {
+            await this.saveManifest();
+            return;
+        }
+        // The old spelling of a file whose case just changed, which must not be taken for a new file.
+        if (!entry && !base && bytes !== undefined && !await this.existsWithThisCase(path)) { return; }
         const kind = entry?.kind ?? base?.kind ?? this.guessKind(path);
         if (!entry && !base && bytes !== undefined && await this.followRename(path, kind, bytes)) {
             await this.saveManifest();
@@ -518,6 +665,90 @@ export class FolderSync implements vscode.Disposable {
     }
 
     /**
+     * A file renamed or moved online keeps its identity, and the local file follows it through the editor, so that
+     * a tab open on it follows too and anything unsaved stays. Otherwise it would look like a deletion and a new file.
+     */
+    private async followOnlineRename(path: string, entry: RemoteEntry | undefined, base: BaseEntry | undefined, bytes: Uint8Array | undefined) {
+        let from: string | undefined;
+        let to: string | undefined;
+        if (entry && !base) {
+            from = Object.entries(this.manifest.files).find(([other, known]) => other !== path && known.remoteVersion === entry.version)?.[0];
+            to = path;
+        } else if (!entry && base?.remoteVersion && bytes !== undefined) {
+            from = path;
+            to = (await this.remote.list()).find((each) => each.version === base.remoteVersion)?.path;
+        }
+        if (from === undefined || to === undefined) { return false; }
+        const known = this.manifest.files[from];
+        if (await this.findRemote(from) || await this.readLocal(from) === undefined) { return false; }
+        const onlyCaseChanged = isSameFileHere(from, to);
+        if (!onlyCaseChanged && (this.manifest.files[to] || await this.readLocal(to) !== undefined)) { return false; }
+
+        const text = known.kind === 'doc' ? await this.readBaseText(from) : undefined;
+        await this.matchFolderCase(to);
+        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.toUri(to), '..'));
+        if (onlyCaseChanged) {
+            // The editor's own rename reports success for this and leaves the name on the disk as it was.
+            await vscode.workspace.fs.rename(this.toUri(from), this.toUri(to), { overwrite: true });
+        } else {
+            const edit = new vscode.WorkspaceEdit();
+            edit.renameFile(this.toUri(from), this.toUri(to), { overwrite: false });
+            if (!await vscode.workspace.applyEdit(edit)) { return false; }
+        }
+        // In this order, as with only the case changing they are the same stored file.
+        await this.clearBase(from);
+        await this.setBase(to, known.kind, known.hash, text, known.remoteVersion);
+        this.clearConflict(from);
+        // What is waiting on the file waits on it under its new name. Otherwise the next look would send an old copy.
+        if (this.heldCopies.delete(from)) {
+            this.heldCopies.add(to);
+            this.manifestChanged = true;
+        }
+        const received = this.lastReceived.get(from);
+        if (received) {
+            this.lastReceived.delete(from);
+            this.lastReceived.set(to, received);
+        }
+        this.report(`Moved ${from} to ${to}, as it was moved online`);
+        this.markDirty(to);
+        return true;
+    }
+
+    /** Where case does not count, a file moved between spellings of a folder stays in the old one, so the folder itself is renamed. */
+    private async matchFolderCase(path: string) {
+        if (!CASE_INSENSITIVE_DISK) { return; }
+        let parent = this.root;
+        for (const part of path.split('/').slice(0, -1)) {
+            const found = (await vscode.workspace.fs.readDirectory(parent)).find(([name]) => name.toLowerCase() === part.toLowerCase());
+            if (found && found[0] !== part) {
+                await vscode.workspace.fs.rename(vscode.Uri.joinPath(parent, found[0]), vscode.Uri.joinPath(parent, part));
+            }
+            parent = vscode.Uri.joinPath(parent, part);
+        }
+    }
+
+    /** Whether a local file is there under exactly this spelling, which reading it does not tell where case does not count. */
+    private async existsWithThisCase(path: string) {
+        if (!CASE_INSENSITIVE_DISK) { return true; }
+        let parent = this.root;
+        for (const part of path.split('/')) {
+            if (!(await vscode.workspace.fs.readDirectory(parent)).some(([name]) => name === part)) { return false; }
+            parent = vscode.Uri.joinPath(parent, part);
+        }
+        return true;
+    }
+
+    private noteOnlineDelete(path: string) {
+        this.onlineDeletes.push(path);
+        if (this.onlineDeleteTimer) { return; }
+        this.onlineDeleteTimer = setTimeout(() => {
+            this.onlineDeleteTimer = undefined;
+            this.options.onOnlineDelete?.(this.onlineDeletes);
+            this.onlineDeletes = [];
+        }, ONLINE_DELETE_NOTICE_MS);
+    }
+
+    /**
      * A file that appeared where another one with the same content is gone was renamed. Renaming it online keeps
      * the document, and so its comments, which uploading a new one and deleting the old one would lose.
      */
@@ -531,7 +762,7 @@ export class FolderSync implements vscode.Disposable {
         for (const [from, known] of Object.entries(this.manifest.files)) {
             if (known.hash !== hash || known.kind !== kind) { continue; }
             if (folderOf(from) !== folderOf(path) && nameOf(from) !== nameOf(path)) { continue; }
-            if (await this.readLocal(from) !== undefined || !await this.findRemote(from)) { continue; }
+            if ((!isSameFileHere(from, path) && await this.readLocal(from) !== undefined) || !await this.findRemote(from)) { continue; }
             // The old path looks like a deletion, and asking about that now could delete the document being renamed.
             const wasPendingDelete = this.pendingDeletes.delete(from);
             this.renaming.add(from);
@@ -650,6 +881,7 @@ export class FolderSync implements vscode.Disposable {
                 await this.moveLocalToTrash(path);
                 await this.clearBase(path);
                 this.clearConflict(path);
+                this.noteOnlineDelete(path);
                 break;
             case 'deleteRemote':
                 this.askToDeleteRemote(path);
@@ -807,6 +1039,7 @@ export class FolderSync implements vscode.Disposable {
                 await this.moveLocalToTrash(path);
                 await this.clearBase(path);
                 this.clearConflict(path);
+                this.noteOnlineDelete(path);
                 break;
             case 'deleteRemote':
                 this.askToDeleteRemote(path);
@@ -837,11 +1070,13 @@ export class FolderSync implements vscode.Disposable {
     }
 
     private askToDeleteRemote(path: string) {
+        if (this.disposed) { return; }
         this.pendingDeletes.add(path);
         if (this.deletePromptTimer) { return; }
         // Deleting a folder deletes many files at once, and they should share one question.
         this.deletePromptTimer = setTimeout(async () => {
             this.deletePromptTimer = undefined;
+            if (this.disposed) { return; }
             // Renaming a folder arrives file by file, and what is still queued may turn out to be renames.
             if (this.loop || this.dirty.size > 0 || this.timers.size > 0) {
                 const next = this.pendingDeletes.values().next().value;
@@ -850,18 +1085,30 @@ export class FolderSync implements vscode.Disposable {
             }
             const paths = [...this.pendingDeletes];
             if (paths.length === 0) { return; } // they all turned out to be renames
+            // Deleting the whole folder removes it file by file for some tools, and is no question about the online files.
+            if (!await this.isStillLinked()) {
+                this.pendingDeletes.clear();
+                return;
+            }
             const confirmed = await this.options.confirmRemoteDelete(paths);
+            const stillLinked = await this.isStillLinked();
+            if (!confirmed) { this.restoringFolders = true; }
             for (const each of paths) {
                 this.pendingDeletes.delete(each);
+                if (!stillLinked || this.disposed) { continue; }
+                this.removingOnline.add(each);
                 try {
                     if (confirmed) { await this.remote.remove(each); }
                     await this.clearBase(each); // if not confirmed, with no base and no local file, the file comes back
                 } catch (error) {
                     this.report(`Could not delete ${each} online: ${error}`);
+                } finally {
+                    this.removingOnline.delete(each);
                 }
                 this.dirty.add(each);
             }
             await this.saveManifest();
+            this.foldersDirty = true; // a folder may be empty now
             this.kick();
         }, DELETE_PROMPT_DELAY_MS);
     }
@@ -907,6 +1154,7 @@ export class FolderSync implements vscode.Disposable {
         if (document && basedOn !== undefined) {
             return document.getText().replace(/\r\n/g, '\n') === basedOn && await this.applyToBuffer(document, text);
         }
+        if (!await this.mayWrite()) { return false; }
         // The folder comes first, to leave as little time as possible between checking the file and writing it.
         await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.toUri(path), '..'));
         const existing = await this.readLocal(path);
@@ -977,12 +1225,14 @@ export class FolderSync implements vscode.Disposable {
     }
 
     private async writeRaw(uri: vscode.Uri, content: Uint8Array) {
+        if (!await this.mayWrite()) { throw new Error('syncing has stopped'); }
         await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(uri, '..'));
         await vscode.workspace.fs.writeFile(uri, content);
     }
 
     /** A file removed by someone online is kept here, in case it was a mistake. */
     private async moveLocalToTrash(path: string) {
+        if (!await this.mayWrite()) { throw new Error('syncing has stopped'); }
         const target = vscode.Uri.joinPath(this.stateDir, 'trash', `${Date.now()}`, path);
         try {
             await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(target, '..'));
@@ -1079,8 +1329,13 @@ export class FolderSync implements vscode.Disposable {
         }
     }
 
+    /** Writing creates whatever folders are missing, so once the folder has gone it would bring parts of it back. */
+    private async mayWrite() {
+        return !(this.disposed && !this.stopping) && await this.isStillLinked();
+    }
+
     private async saveManifest() {
-        if (!this.manifestChanged) { return; }
+        if (!this.manifestChanged || !await this.mayWrite()) { return; }
         this.manifest.held = [...this.heldCopies];
         const temporary = vscode.Uri.joinPath(this.stateDir, 'manifest.json.saving');
         await vscode.workspace.fs.writeFile(temporary, new TextEncoder().encode(JSON.stringify(this.manifest, null, 1)));

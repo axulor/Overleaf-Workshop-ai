@@ -28,6 +28,8 @@ export interface FileEntity {
     readonly?: boolean,
 }
 
+export type ProjectStanding = 'active' | 'trashed' | 'archived' | 'gone' | 'loggedOut' | 'offline' | 'unknown';
+
 export interface DocumentEntity extends FileEntity {
     version?: number,
     mtime?: number,
@@ -157,6 +159,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private handlersRegistered: boolean = false;
     private updateQueue?: Promise<unknown>;
     private gaveUpRetrying: boolean = false;
+    private hasLeft: boolean = false;
     private outputBuildId?: string;
     private compileGroup?: string;
     private clsiServerId?: string;
@@ -220,6 +223,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         const MAX_RETRIES = 5;
         const BASE_DELAY_MS = 1000; // 1 second base delay
 
+        if (this.hasLeft) { return Promise.reject(new Error('this window has left the project')); }
+
         // if retry connection exhausted, show error
         if (this.retryConnection >= MAX_RETRIES) {
             this.gaveUpRetrying = true;
@@ -233,7 +238,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             ).then((choice) => {
                 if (choice === vscode.l10n.t('Reload')) {
                     vscode.commands.executeCommand("workbench.action.reloadWindow");
-                } else if (choice === vscode.l10n.t('Retry')) {
+                } else if (choice === vscode.l10n.t('Retry') && !this.hasLeft) {
                     this.retryConnection = 0;
                     this.gaveUpRetrying = false;
                     this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
@@ -258,7 +263,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // Keep the notification visible while reconnecting
                 await new Promise<void>((resolve) => {
                     const check = () => {
-                        if (this.root || this.retryConnection >= MAX_RETRIES) {
+                        if (this.root || this.hasLeft || this.retryConnection >= MAX_RETRIES) {
                             this.reconnectingNotification = false;
                             resolve();
                         } else {
@@ -275,6 +280,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (delayMs > 0) {
                 await new Promise(resolve => setTimeout(resolve, delayMs));
             }
+            if (this.hasLeft) { throw new Error('this window has left the project'); }
 
             this.prepareSocket();
 
@@ -324,6 +330,30 @@ export class VirtualFileSystem extends vscode.Disposable {
         };
 
         return attemptReconnect();
+    }
+
+    /** Asks the server itself, whose answer does not depend on word of a change having reached this window. */
+    async isFolderEmptyOnServer(path: string) {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.projectEntitiesJson(identity, this.projectId);
+        if (res.type!=='success' || !res.entities) { throw new Error(res.message ?? 'Overleaf did not list the project'); }
+        return !res.entities.some((entity) => entity.path.startsWith(`/${path}/`));
+    }
+
+    /** Whether it has stopped trying to reconnect, and so will not without being told to. */
+    get hasGivenUp() {
+        return this.gaveUpRetrying;
+    }
+
+    /** Stops being connected to the project for good. Used through RemoteFileSystemProvider.forget. */
+    leave() {
+        this.hasLeft = true;
+        clearTimeout(this.retryTimer);
+        this.clientManagerItem?.triggers.forEach((trigger) => trigger.dispose());
+        this.clientManagerItem = undefined;
+        this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
+        this.scmCollectionItem = undefined;
+        this.socket.close();
     }
 
     private prepareSocket() {
@@ -483,7 +513,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private remoteWatch(): void {
         this.socket.updateEventHandlers({
             onDisconnected: () => {
-                if (this.root===undefined) { return; } // bypass the first initialization
+                if (this.root===undefined || this.hasLeft) { return; } // bypass the first initialization
                 console.log("Disconnected");
                 EventBus.fire('projectDisconnectedEvent', {projectId: this.projectId});
                 // Debounce: ignore rapid disconnect/reconnect cycles (within 2 seconds)
@@ -1561,13 +1591,24 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     readonly onDidChangeFile: vscode.Event<vscode.FileChangeEvent[]> = this._emitter.event;
 
     private vfss: {[key:string]:VirtualFileSystem};
+    private readonly gates = new Map<string, Promise<boolean>>();
 
     constructor(private context: vscode.ExtensionContext) {
         this.context = context;
         this.vfss = {};
     }
 
-    private getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {
+    /**
+     * Whether a project may be connected to. A project in the trash or gone has nothing to connect to, and a PDF tab being
+     * restored or a compile finishing would otherwise do it. It is a promise as the answer may have to be found out first.
+     */
+    setGate(uri: vscode.Uri, open: Promise<boolean>) {
+        this.gates.set(uri.query, open);
+    }
+
+    private async getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {
+        const gate = this.gates.get(uri.query);
+        if (gate && !await gate) { throw vscode.FileSystemError.Unavailable(uri); }
         const vfs = this.vfss[ uri.query ];
         if (vfs) {
             return Promise.resolve(vfs);
@@ -1580,6 +1621,46 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
 
     prefetch(uri: vscode.Uri): Promise<VirtualFileSystem> {
         return this.getVFS(uri).then((vfs) => {return vfs;});
+    }
+
+    /** Disconnects from a project, so that nothing here is connected to it until it is asked for again. */
+    forget(uri: vscode.Uri) {
+        this.vfss[uri.query]?.leave();
+        delete this.vfss[uri.query];
+    }
+
+    /**
+     * Where a project stands on Overleaf, for this user. Moving a project to the trash or archive sends no message
+     * to anyone, so this has to be asked. 'unknown' means it cannot be told now, as when offline or logged out, which
+     * must never be taken for the project being gone.
+     */
+    async projectStanding(uri: vscode.Uri): Promise<ProjectStanding> {
+        const {serverName, projectId, userId} = parseUri(uri);
+        const login = GlobalStateManager.getServers(this.context).find(({server}) => server.name===serverName);
+        // Another account being logged in says nothing about this account's project.
+        if (!login?.server.login || login.server.login.userId!==userId) { return 'loggedOut'; }
+        const {api, server} = login;
+        const identity = server.login!.identity;
+        const isExpired = (res:{type:string, message?:string}) => res.type==='error' && /^302\b/.test(res.message ?? '');
+        // Every answer from a server starts with its status.
+        const isUnreachable = (res:{type:string, message?:string}) => res.type==='error' && !/^\d{3}\b/.test(res.message ?? '');
+
+        let projects = await api.getProjectsJson(identity);
+        if (projects.type!=='success' && !isExpired(projects)) {
+            // Some servers lack this. The other list leaves out archived and trashed projects, so those look absent below.
+            projects = await api.userProjectsJson(identity);
+        }
+        if (isExpired(projects)) { return 'loggedOut'; }
+        if (isUnreachable(projects)) { return 'offline'; }
+        if (projects.type!=='success' || !projects.projects) { return 'unknown'; }
+        const project = projects.projects.find((each) => each.id===projectId);
+        if (project) {
+            return project.trashed ? 'trashed' : project.archived ? 'archived' : 'active';
+        }
+        // Absent from the list, so ask for the project itself: only a clear refusal says it is gone.
+        const direct = await api.projectEntitiesJson(identity, projectId);
+        if (isExpired(direct)) { return 'loggedOut'; }
+        return direct.type==='error' && /^(403|404)\b/.test(direct.message ?? '') ? 'gone' : 'unknown';
     }
 
     notify(events :vscode.FileChangeEvent[]) {

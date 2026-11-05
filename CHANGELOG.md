@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This fork has its own version numbers, starting from Overleaf Workshop 0.15.10. Entries below this section are from the original project.
 
+### [0.7.0] - 2026-11-06
+What happens to the project on either side now carries through to the other. Each rule was checked on real Overleaf, with a temporary project made for it and permanently deleted afterwards.
+- Deleting the whole local folder no longer touches the online project and asks nothing: syncing simply stops, and nothing brings the folder back. Restoring the folder from the recycle bin resumes syncing.
+- A project moved to the trash or archive, in the plugin or on the website, pauses syncing and closes the connection, and syncing continues by itself once it is restored, merging what changed on both sides meanwhile. In the plugin, pending changes are sent first. On the website it is noticed within about a minute, or on coming back to the window.
+- A project permanently deleted, or that the user was removed from, ends the link: the files stay as an ordinary folder, which no longer stops another project being linked there.
+- A lapsed login shows in the status bar and syncing continues after logging in again, and a window opened with no connection starts by itself once Overleaf answers. Neither is ever taken for the project being gone.
+- Folders sync in their own right. An empty folder appears on the other side, and one deleted or emptied on one side goes on the other. A folder is only removed online when the server says it is empty, and one holding only files that do not sync stays local.
+- Files and folders renamed or moved online follow locally, with open tabs, instead of looking like a deletion and a new file. A file waiting on a conflict stays held under its new name.
+- A change of case alone is a rename, in both directions. Before this, on Windows it could look like a deletion, or upload a second copy.
+- Files deleted by a collaborator are mentioned in a notice, with where the local copy went.
+- Deleting every file warns that it empties the project, with keeping the files as the default. Answering no to deleting a folder brings back the empty folders in it too.
+- Deleting several files is asked about once. Before this, the question could come round again while the first answer was being carried out.
+- Nothing connects to a project in the trash or that has gone, including a PDF tab being restored and a compile finishing, and a reconnect that was waiting is cancelled on leaving.
+
 ### [0.6.0] - 2026-11-05
 Fixes from a review for data loss, ahead of the first use on a real paper, each checked against real Overleaf.
 - A collaborator's edit that arrives during a merge or a push is no longer removed: writes state the text they were based on.

@@ -230,6 +230,17 @@ export class SocketIOAPI {
         this.socket.disconnect();
     }
 
+    /** Disconnects for good. Waiting to reconnect is not a connection, so disconnecting does not stop it, and it would connect again later. */
+    close() {
+        const underlying = this.socket.socket;
+        if (underlying) {
+            underlying.options.reconnect = false;
+            underlying.reconnecting = false;
+            clearTimeout(underlying.reconnectionTimer);
+        }
+        this.socket.disconnect();
+    }
+
     get handlers() {
         return this._handlers;
     }
