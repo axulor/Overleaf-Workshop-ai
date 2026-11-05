@@ -1,8 +1,9 @@
+import { randomBytes } from 'crypto';
 import * as vscode from 'vscode';
 import { OUTPUT_FOLDER_NAME } from '../consts';
 import { FileRefEntity, RemoteFileSystemProvider, VirtualFileSystem } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
-import { CommentSource, OnlineComment, joinComments } from './comments';
+import { CommentSource, OnlineComment, joinComments, locateQuote } from './comments';
 import { RemoteEntry, RemoteSide } from './folderSync';
 
 /** The online side of a folder sync: an Overleaf project, through the extension's virtual file system. */
@@ -103,6 +104,22 @@ export class VfsRemoteSide implements RemoteSide, CommentSource, vscode.Disposab
 
     async setCommentResolved(comment: OnlineComment, resolved: boolean) {
         await this.vfs.setCommentResolved(comment.docId, comment.threadId, resolved);
+    }
+
+    async addComment(path: string, quote: string, offset: number, text: string) {
+        const { fileType } = await this.vfs._resolveUri(this.uri(path));
+        if (fileType !== 'doc') { throw new Error(`${path} 不是 Overleaf 上的文档`); }
+        const at = locateQuote(await this.readDoc(path), quote, offset);
+        if (at === undefined) { throw new Error('这段文字还没有同步到 Overleaf，请稍后再试'); }
+        // In the order of Overleaf's own page, so that a comment never shows with nothing said in it.
+        const threadId = Math.floor(Date.now() / 1000).toString(16).padStart(8, '0') + randomBytes(8).toString('hex');
+        await this.vfs.addCommentMessage(threadId, text);
+        await this.vfs.addCommentRange(this.uri(path), threadId, quote, at);
+        return threadId;
+    }
+
+    async addReply(comment: OnlineComment, text: string) {
+        await this.vfs.addCommentMessage(comment.threadId, text);
     }
 
     private async ensureFolder(path: string) {

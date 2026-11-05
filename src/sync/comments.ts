@@ -5,6 +5,8 @@ import { decodeText } from './merge';
 
 export const COMMENTS_FILE_NAME = 'comments.md';
 
+const THREAD_LABEL = 'Overleaf 批注';
+
 const REFRESH_DELAY_MS = 500;
 const RELOCATE_DELAY_MS = 800;
 /** Reading comments makes Overleaf save the project, which typing in a commented paragraph should not do at every pause. */
@@ -32,6 +34,9 @@ export interface CommentSource {
     readonly onDidChangeComments: vscode.Event<void>;
     readComments(): Promise<OnlineComment[]>;
     setCommentResolved(comment: OnlineComment, resolved: boolean): Promise<void>;
+    /** Starts a comment on text that the server has, and returns its thread id. */
+    addComment(path: string, quote: string, offset: number, text: string): Promise<string>;
+    addReply(comment: OnlineComment, text: string): Promise<void>;
 }
 
 /** Overleaf keeps where comments are and what was said apart. A comment with nothing said yet is still being created. */
@@ -139,8 +144,18 @@ export class ProjectComments implements vscode.Disposable {
         private readonly projectName: string,
         private readonly source: CommentSource,
         private readonly log: (message: string) => void,
+        /** Brings local changes to the server, as a new comment is placed on the server's text. */
+        private readonly sendLocalChanges: () => Promise<void>,
     ) {
         this.outputFolder = vscode.Uri.joinPath(folder, OUTPUT_FOLDER_NAME);
+        this.controller.options = {prompt: '回复…', placeHolder: '写下内容'};
+        this.controller.commentingRangeProvider = {
+            provideCommentingRanges: (document) => {
+                const path = this.pathOf(document.uri);
+                if (path === undefined || path.split('/').some((part) => part.startsWith('.'))) { return []; }
+                return [new vscode.Range(0, 0, document.lineCount - 1, document.lineAt(document.lineCount - 1).text.length)];
+            },
+        };
     }
 
     async start() {
@@ -175,6 +190,41 @@ export class ProjectComments implements vscode.Disposable {
         const shown = [...this.shown].find(([, entry]) => entry.thread === thread);
         const comment = this.comments.find((candidate) => candidate.threadId === shown?.[0]);
         if (comment) { await this.setResolved(comment, true); }
+    }
+
+    /** For the button under a comment's box: a reply to a comment, or in a new thread the comment itself. */
+    async submit({ thread, text }: vscode.CommentReply) {
+        const content = text.trim();
+        if (!content) { return; }
+        try {
+            const threadId = [...this.shown].find(([, entry]) => entry.thread === thread)?.[0];
+            const comment = this.comments.find((candidate) => candidate.threadId === threadId);
+            if (comment) {
+                await this.source.addReply(comment, content);
+            } else {
+                await this.startComment(thread, content);
+            }
+        } catch (error) {
+            this.showError(`无法提交批注：${error instanceof Error ? error.message : String(error)}`);
+            return;
+        }
+        await this.refresh();
+    }
+
+    private async startComment(thread: vscode.CommentThread, content: string) {
+        const path = this.pathOf(thread.uri);
+        if (path === undefined) { throw new Error('这个文件不在 Overleaf 项目里'); }
+        const document = await vscode.workspace.openTextDocument(thread.uri);
+        await this.sendLocalChanges();
+        // A click in the margin gives a place on a line, and a selection gives the text.
+        const range = thread.range.isEmpty ? document.lineAt(thread.range.start.line).range : thread.range;
+        const quote = document.getText(range).replace(/\r\n/g, '\n');
+        if (!quote) { throw new Error('这一行没有文字可以批注'); }
+        const offset = document.getText(new vscode.Range(new vscode.Position(0, 0), range.start)).replace(/\r\n/g, '\n').length;
+        const threadId = await this.source.addComment(path, quote, offset, content);
+        // The box stays where it is and becomes the comment.
+        thread.label = THREAD_LABEL;
+        this.shown.set(threadId, {thread, said: ''});
     }
 
     /** A resolved comment shows nowhere in the editor, so a mistaken click is undone from a list. */
@@ -325,8 +375,7 @@ export class ProjectComments implements vscode.Disposable {
             let entry = this.shown.get(threadId);
             if (!entry) {
                 const thread = this.controller.createCommentThread(this.uriOf(comment.path), comment.range!, []);
-                thread.canReply = false;
-                thread.label = 'Overleaf 批注';
+                thread.label = THREAD_LABEL;
                 thread.collapsibleState =vscode.CommentThreadCollapsibleState.Collapsed;
                 entry = {thread, said: ''};
                 this.shown.set(threadId, entry);

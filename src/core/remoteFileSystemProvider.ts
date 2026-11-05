@@ -155,6 +155,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private lastDisconnectTime: number = 0;
     /** Whether event handlers have been registered on the current socket */
     private handlersRegistered: boolean = false;
+    private updateQueue?: Promise<unknown>;
     private outputBuildId?: string;
     private compileGroup?: string;
     private clsiServerId?: string;
@@ -947,6 +948,67 @@ export class VirtualFileSystem extends vscode.Disposable {
      * the content, and merging again could apply someone else's change a second time.
      */
     async replaceDocContent(uri: vscode.Uri, text: string) {
+        return this.inTurn(() => this.replaceDocContentNow(uri, text));
+    }
+
+    /** Marks where a comment is, once what was said in it is on the server. The text must be what the server has at that offset. */
+    async addCommentRange(uri: vscode.Uri, threadId: string, quote: string, offset: number) {
+        return this.inTurn(async () => {
+            const {fileType, fileEntity} = await this._resolveUri(uri);
+            if (fileType!=='doc' || !fileEntity) {
+                throw vscode.FileSystemError.FileNotFound(uri);
+            }
+            const doc = fileEntity as DocumentEntity;
+            if (doc.version===undefined || doc.remoteCache===undefined) {
+                await this.openFile(uri);
+            }
+            if (!doc.remoteCache!.startsWith(quote, offset)) {
+                throw new Error('the commented text is no longer there on Overleaf');
+            }
+            await this.sendUpdate(doc, {doc: doc._id, lastV: doc.lastVersion, v: doc.version!, op: [{c: quote, p: offset, t: threadId}]});
+            if (doc.changedWhileSending) {
+                doc.remoteCache = undefined;
+                doc.localCache = undefined;
+                this.notify([{type: vscode.FileChangeType.Changed, uri}]);
+            }
+        });
+    }
+
+    /** Updates to the server wait for each other, as each needs the version the one before it brought. */
+    private inTurn<T>(work: () => Promise<T>): Promise<T> {
+        const result = (this.updateQueue ?? Promise.resolve()).then(work);
+        this.updateQueue = result.catch(() => {});
+        return result;
+    }
+
+    /** Sends an update, and returns when the server has applied it. */
+    private async sendUpdate(doc: DocumentEntity, update: UpdateSchema) {
+        doc.sendingUpdate = true;
+        doc.changedWhileSending = false;
+        // The server replies when it has queued the update, and acknowledges later when it has applied it.
+        // Only then is the version known, and sending the next update before that would apply it in the wrong place.
+        // (Invisible mode only collects changes for later, so it has nothing to acknowledge.)
+        let ackTimer: NodeJS.Timeout | undefined;
+        const acknowledgement = this.isInvisibleMode ? Promise.resolve() : new Promise<void>((resolve, reject) => {
+            doc.acknowledged = resolve;
+            ackTimer = setTimeout(() => reject(new Error('Overleaf did not acknowledge the update in time')), ACK_TIMEOUT_MS);
+        });
+        try {
+            await Promise.all([this.socket.applyOtUpdate(doc._id, update), acknowledgement]);
+        } catch (error) {
+            // It may or may not have been applied, so the only trustworthy version is the server's.
+            doc.remoteCache = undefined;
+            doc.localCache = undefined;
+            throw error;
+        } finally {
+            clearTimeout(ackTimer);
+            doc.acknowledged = undefined;
+            doc.sendingUpdate = false;
+        }
+        doc.lastVersion = doc.version;
+    }
+
+    private async replaceDocContentNow(uri: vscode.Uri, text: string) {
         const {fileType, fileEntity} = await this._resolveUri(uri);
         if (fileType!=='doc' || !fileEntity) {
             throw vscode.FileSystemError.FileNotFound(uri);
@@ -981,31 +1043,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             update.hash = hashDocText(text);
         }
 
-        doc.sendingUpdate = true;
-        doc.changedWhileSending = false;
-        // The server replies when it has queued the update, and acknowledges later when it has applied it.
-        // Only then is the version known, and sending the next update before that would apply it in the wrong place.
-        // (Invisible mode only collects changes for later, so it has nothing to acknowledge.)
-        let ackTimer: NodeJS.Timeout | undefined;
-        const acknowledgement = this.isInvisibleMode ? Promise.resolve() : new Promise<void>((resolve, reject) => {
-            doc.acknowledged = resolve;
-            ackTimer = setTimeout(() => reject(new Error('Overleaf did not acknowledge the update in time')), ACK_TIMEOUT_MS);
-        });
-        try {
-            await Promise.all([this.socket.applyOtUpdate(doc._id, update), acknowledgement]);
-        } catch (error) {
-            // It may or may not have been applied, so the only trustworthy version is the server's.
-            doc.remoteCache = undefined;
-            doc.localCache = undefined;
-            throw error;
-        } finally {
-            clearTimeout(ackTimer);
-            doc.acknowledged = undefined;
-            doc.sendingUpdate = false;
-        }
+        await this.sendUpdate(doc, update);
 
         this.isDirty = true;
-        doc.lastVersion = doc.version;
         if (doc.changedWhileSending) {
             // Someone else's edit arrived while ours was on its way, so the server holds both, and neither
             // this text nor the cache is what it has. Catch up by joining the document again.
@@ -1463,6 +1503,15 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw new Error(ranges.message ?? threads.message ?? 'Overleaf did not return the comments');
         }
         return {docRanges: ranges.docRanges ?? [], threads: threads.threads ?? {}};
+    }
+
+    /** Also how a comment starts: its thread exists from its first message. */
+    async addCommentMessage(threadId:string, content:string) {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.addCommentMessage(identity, this.projectId, threadId, content);
+        if (res.type!=='success') {
+            throw new Error(res.message ?? 'Overleaf did not accept the message');
+        }
     }
 
     async setCommentResolved(docId:string, threadId:string, resolved:boolean) {

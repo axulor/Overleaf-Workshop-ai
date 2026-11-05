@@ -964,6 +964,11 @@ export class BaseAPI {
         }, {'X-Csrf-Token': identity.csrfToken});
     }
 
+    async addCommentMessage(identity:Identity, projectId:string, threadId:string, content:string) {
+        this.setIdentity(identity);
+        return this.request('POST', `project/${projectId}/thread/${threadId}/messages`, {content}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
     async setCommentThreadResolved(identity:Identity, projectId:string, docId:string, threadId:string, resolved:boolean) {
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/doc/${docId}/thread/${threadId}/${resolved ? 'resolve' : 'reopen'}`, {}, undefined, {'X-Csrf-Token': identity.csrfToken});

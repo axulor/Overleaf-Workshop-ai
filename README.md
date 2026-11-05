@@ -26,7 +26,11 @@ Open your paper's folder, hover over a project in the Overleaf panel and click t
 
 ### Comments
 
-Comments made on Overleaf show on the commented text and in VS Code's Comments panel, and follow the text as it changes. The ✓ on a comment resolves it, and the button at the top of the Comments panel reopens a resolved one. Replying still happens on Overleaf.
+Comments made on Overleaf show on the commented text and in VS Code's Comments panel, and follow the text as it changes. You can also work with them here, and collaborators see it as it happens:
+
+- To add a comment, select text and choose `添加 Overleaf 批注` from the right-click menu, or click the `+` beside a line to comment on that line.
+- To reply, open a comment and write in the box under it.
+- The ✓ on a comment resolves it, and the button at the top of the Comments panel reopens a resolved one.
 
 They are also kept in `.output/comments.md` in the project folder, with the file, line, commented text, author and words of each comment, so any tool can read them. This file is rewritten when comments change, and the `.output` folder is kept out of git.
 

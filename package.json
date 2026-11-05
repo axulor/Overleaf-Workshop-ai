@@ -2,7 +2,7 @@
   "name": "overleaf-workshop-ai",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "icon": "resources/icons/app_icon.png",
   "license": "AGPL-3.0-only",
   "author": {
@@ -296,6 +296,21 @@
         "command": "overleaf-workshop.sync.reopenComment",
         "title": "重新打开已解决的批注",
         "icon": "$(history)",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.addComment",
+        "title": "添加批注",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.replyComment",
+        "title": "回复",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.sync.addCommentOnSelection",
+        "title": "添加 Overleaf 批注",
         "category": "%extension.displayName%"
       },
       {
@@ -611,13 +626,37 @@
         {
           "command": "overleaf-workshop.sync.reopenComment",
           "when": "overleaf-workshop.hasResolvedComments"
+        },
+        {
+          "command": "overleaf-workshop.sync.addComment",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.sync.replyComment",
+          "when": "false"
+        },
+        {
+          "command": "overleaf-workshop.sync.addCommentOnSelection",
+          "when": "false"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "overleaf-workshop.sync.addComment",
+          "group": "inline",
+          "when": "commentController == overleaf-workshop-ai.comments && commentThreadIsEmpty"
+        },
+        {
+          "command": "overleaf-workshop.sync.replyComment",
+          "group": "inline",
+          "when": "commentController == overleaf-workshop-ai.comments && !commentThreadIsEmpty"
         }
       ],
       "comments/commentThread/title": [
         {
           "command": "overleaf-workshop.sync.resolveComment",
           "group": "inline",
-          "when": "commentController == overleaf-workshop-ai.comments"
+          "when": "commentController == overleaf-workshop-ai.comments && !commentThreadIsEmpty"
         }
       ],
       "explorer/context": [
@@ -631,6 +670,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "overleaf-workshop.sync.addCommentOnSelection",
+          "group": "1_modification@0",
+          "when": "editorHasSelection && resourceScheme == file && overleaf-workshop.activateCompile"
+        },
         {
           "command": "overleaf-workshop.collaboration.copyLineRef",
           "when": "resourceScheme == overleaf-workshop || overleaf-workshop.activate"

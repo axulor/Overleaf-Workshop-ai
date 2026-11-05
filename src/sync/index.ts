@@ -40,6 +40,9 @@ export class FolderSyncManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.sync.showStatus`, () => this.showStatus()),
             vscode.commands.registerCommand(`${ROOT_NAME}.sync.resolveComment`, (thread: vscode.CommentThread) => this.comments?.resolve(thread)),
             vscode.commands.registerCommand(`${ROOT_NAME}.sync.reopenComment`, () => this.comments?.reopen()),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.addComment`, (reply: vscode.CommentReply) => this.comments?.submit(reply)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.replyComment`, (reply: vscode.CommentReply) => this.comments?.submit(reply)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.sync.addCommentOnSelection`, () => vscode.commands.executeCommand('workbench.action.addComment')),
         ];
     }
 
@@ -191,7 +194,10 @@ export class FolderSyncManager {
 
             await this.sync.start();
             this.log.info(`Syncing ${folder.fsPath} with ${parseUri(projectUri).projectName}`);
-            this.comments = new ProjectComments(folder, parseUri(projectUri).projectName, this.remote, (message) => this.log.info(message));
+            this.comments = new ProjectComments(folder, parseUri(projectUri).projectName, this.remote, (message) => this.log.info(message), async () => {
+                await vscode.workspace.saveAll(false);
+                await this.sync?.flush();
+            });
             await this.comments.start();
         } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);

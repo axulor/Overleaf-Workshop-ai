@@ -430,6 +430,7 @@ async function testReplaceDocContent(VirtualFileSystem, GlobalStateManager) {
         if (result.slice(o.p, o.p + o.d.length) !== o.d) throw new Error('a delete does not match the text');
         result = result.slice(0, o.p) + result.slice(o.p + o.d.length);
       }
+      if (o.c !== undefined && result.slice(o.p, o.p + o.c.length) !== o.c) throw new Error('a comment does not match the text');
     }
     return result;
   };
@@ -560,6 +561,43 @@ async function testReplaceDocContent(VirtualFileSystem, GlobalStateManager) {
   check('receiving: so is a change to a thread', commentEvents === 2, String(commentEvents));
   listening.dispose();
 
+  // marking where a comment is
+  server = { text: 'Some 疫苗 text.\n', version: 2 };
+  t = make(server);
+  await t.vfs.addCommentRange(DOC_URI, 'thread1', '疫苗', 5);
+  const lastSent = t.sent[t.sent.length - 1];
+  check('comment place: only the mark is sent', lastSent.op.length === 1 && lastSent.op[0].c === '疫苗' && lastSent.op[0].p === 5 && lastSent.op[0].t === 'thread1' && lastSent.v === 2, JSON.stringify(lastSent));
+  check('comment place: the text stays, and the version moves on', server.text === 'Some 疫苗 text.\n' && t.doc.remoteCache === server.text && t.doc.version === 3, `${JSON.stringify(t.doc.remoteCache)} ${t.doc.version}`);
+  const sentBeforeRefusal = t.sent.length;
+  thrown = false;
+  await t.vfs.addCommentRange(DOC_URI, 'thread2', 'not in the text', 0).catch(() => { thrown = true; });
+  check('comment place: text that is not there is refused here, as the server would drop the connection', thrown && t.sent.length === sentBeforeRefusal);
+
+  // the sync and a comment can want to send at the same moment
+  server = { text: 'Base.\n', version: 3, ackLater: true };
+  t = make(server);
+  await t.vfs.openFile(DOC_URI);
+  const updates = () => t.sent.filter((s) => s !== 'join');
+  const firstUpdate = t.vfs.replaceDocContent(DOC_URI, 'Base one.\n');
+  await sleep(50);
+  const secondUpdate = t.vfs.addCommentRange(DOC_URI, 'thread1', 'Base', 0);
+  await sleep(100);
+  check('in turn: an update waits while another is on its way', updates().length === 1, JSON.stringify(updates()));
+  t.handlers.onFileChanged({ doc: 'doc1', v: 3 });
+  await firstUpdate;
+  await sleep(50);
+  check('in turn: then it goes, with the version the first one brought', updates().length === 2 && updates()[1].v === 4, JSON.stringify(updates()));
+  t.handlers.onFileChanged({ doc: 'doc1', v: 4 });
+  await secondUpdate;
+
+  server = { text: 'Base.\n', version: 3, fail: true };
+  t = make(server);
+  await t.vfs.openFile(DOC_URI);
+  await t.vfs.replaceDocContent(DOC_URI, 'Fails.\n').catch(() => {});
+  server.fail = false;
+  await t.vfs.replaceDocContent(DOC_URI, 'Works.\n');
+  check('in turn: a failed update does not hold up the next', server.text === 'Works.\n', JSON.stringify(server.text));
+
   // handlers survive a new socket, as overleaf.com refuses the first kind of connection
   let registered = 0, recreated = 0;
   const vfs = Object.create(VirtualFileSystem.prototype);
@@ -655,11 +693,23 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
       if (this.refuse) throw new Error('403: not allowed');
       this.changes.push({ threadId: target.threadId, docId: target.docId, resolved });
     },
+    added: [],
+    replies: [],
+    async addComment(file, quote, offset, text) {
+      if (this.refuse) throw new Error('403: not allowed');
+      this.added.push({ file, quote, offset, text });
+      return 'new-thread';
+    },
+    async addReply(target, text) {
+      if (this.refuse) throw new Error('403: not allowed');
+      this.replies.push({ threadId: target.threadId, text });
+    },
   };
   const logged = [];
   put(main, 'first line\nb 疫苗 target here\n');
   source.comments = [comment('t1', 'target', 'first line\nb 疫苗 '.length)];
-  const comments = new ProjectComments(vscode.Uri.file(folder), 'My Paper', source, (m) => logged.push(m));
+  let localChangesSent = 0;
+  const comments = new ProjectComments(vscode.Uri.file(folder), 'My Paper', source, (m) => logged.push(m), async () => { localChangesSent++; });
   await comments.start();
   const thread = (id) => comments.shown.get(id)?.thread;
   const rangeIs = (id, startLine, startCharacter, endLine, endCharacter) => {
@@ -669,7 +719,7 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   const shownRange = (id) => JSON.stringify(thread(id)?.range);
 
   check('comments: shown on the commented text, counting Chinese as the editor does', rangeIs('t1', 1, 5, 1, 11), shownRange('t1'));
-  check('comments: they cannot be replied to here, so no box invites it', thread('t1').canReply === false);
+  check('comments: they can be replied to', thread('t1').canReply !== false);
   check('comments: collapsed, so they do not push the text apart', thread('t1').collapsibleState === vscode.CommentThreadCollapsibleState.Collapsed);
   check('comments: the thread shows who said what', thread('t1').comments.length === 1 && thread('t1').comments[0].author.name === 'Ada Lovelace' && thread('t1').comments[0].body === '这里要改');
   let text = listing();
@@ -785,9 +835,82 @@ async function testComments({ ProjectComments, joinComments, locateQuote }) {
   check('refused: and the user is told why', errors.length === 1 && errors[0].includes('403'), JSON.stringify(errors));
   source.refuse = false;
 
+  // replying here
+  const repliedReads = source.reads;
+  await comments.submit({ thread: thread('t2'), text: '  同意  ' });
+  check('replying: Overleaf is told which comment, and the words without stray spaces', source.replies.length === 1 && source.replies[0].threadId === 't2' && source.replies[0].text === '同意', JSON.stringify(source.replies));
+  check('replying: the thread is read again, to show the reply', source.reads > repliedReads);
+  await comments.submit({ thread: thread('t2'), text: '   ' });
+  check('replying: nothing written, nothing sent', source.replies.length === 1);
+  errors.length = 0;
+  source.refuse = true;
+  await comments.submit({ thread: thread('t2'), text: 'no' });
+  source.refuse = false;
+  check('replying: a refusal is explained', errors.length === 1 && errors[0].includes('403'), JSON.stringify(errors));
+
+  // adding here, the way VS Code offers it: an empty thread on a place, with a box
+  const provider = comments.controller.commentingRangeProvider;
+  const token = new vscode.CancellationTokenSource().token;
+  const opened = await vscode.workspace.openTextDocument(main);
+  const offered = provider.provideCommentingRanges(opened, token);
+  check('adding: a project file can be commented on as a whole', offered.length === 1 && offered[0].start.line === 0 && offered[0].end.line === opened.lineCount - 1, JSON.stringify(offered));
+  check('adding: the comments file cannot', provider.provideCommentingRanges(await vscode.workspace.openTextDocument(output), token).length === 0);
+  const outsideFile = path.join(workspaceRoot(), 'outside.tex');
+  put(outsideFile, 'outside\n');
+  check('adding: a file outside the project cannot', provider.provideCommentingRanges(await vscode.workspace.openTextDocument(outsideFile), token).length === 0);
+  fs.rmSync(outsideFile, { force: true });
+
+  const documentShows = (text) => until(async () => (await vscode.workspace.openTextDocument(main)).getText().replace(/\r\n/g, '\n') === text);
+  const newThread = (...range) => comments.controller.createCommentThread(vscode.Uri.file(main), new vscode.Range(...range), []);
+  const lastAdded = () => source.added[source.added.length - 1];
+  put(main, 'first line\r\nb 疫苗 tar here\r\n\r\nlast\r\n');
+  await documentShows('first line\nb 疫苗 tar here\n\nlast\n');
+
+  const sentBefore = localChangesSent;
+  let box = newThread(1, 2, 1, 4);
+  source.comments = [comment('new-thread', '疫苗', 'first line\nb '.length)];
+  await comments.submit({ thread: box, text: ' 看这里 ' });
+  check('adding: the selected text, counted without CRLF, and the words', lastAdded()?.file === 'main.tex' && lastAdded()?.quote === '疫苗' && lastAdded()?.offset === 'first line\nb '.length && lastAdded()?.text === '看这里', JSON.stringify(lastAdded()));
+  check('adding: local changes go first, as the place is on the server\'s text', localChangesSent === sentBefore + 1);
+  check('adding: the box becomes the comment', thread('new-thread') === box && box.comments.length === 1 && box.comments[0].body === '这里要改');
+  check('adding: and sits on the text', rangeIs('new-thread', 1, 2, 1, 4), shownRange('new-thread'));
+  check('adding: it has the same label as any other', box.label === 'Overleaf 批注', box.label);
+
+  box = newThread(0, 6, 1, 1);
+  await comments.submit({ thread: box, text: 'two lines' });
+  check('adding: a selection over lines keeps LF', lastAdded().quote === 'line\nb' && lastAdded().offset === 6, JSON.stringify(lastAdded()));
+  box.dispose();
+
+  box = newThread(1, 0, 1, 0);
+  await comments.submit({ thread: box, text: 'whole line' });
+  check('adding: a click in the margin comments on the line', lastAdded().quote === 'b 疫苗 tar here' && lastAdded().offset === 'first line\n'.length, JSON.stringify(lastAdded()));
+  box.dispose();
+
+  errors.length = 0;
+  let addedBefore = source.added.length;
+  box = newThread(2, 0, 2, 0);
+  await comments.submit({ thread: box, text: 'empty line' });
+  check('adding: an empty line has nothing to comment on', source.added.length === addedBefore && errors.length === 1 && errors[0].includes('没有文字'), JSON.stringify(errors));
+  check('adding: and the box stays', box.comments.length === 0);
+  box.dispose();
+
+  errors.length = 0;
+  source.refuse = true;
+  box = newThread(3, 0, 3, 4);
+  await comments.submit({ thread: box, text: 'refused' });
+  source.refuse = false;
+  check('adding: a refusal is explained', errors.length === 1 && errors[0].includes('403'), JSON.stringify(errors));
+  box.dispose();
+
+  addedBefore = source.added.length;
+  box = newThread(3, 0, 3, 4);
+  await comments.submit({ thread: box, text: '   ' });
+  check('adding: nothing written, nothing sent', source.added.length === addedBefore);
+  box.dispose();
+
   source.comments = [comment('t3', '', 0, { path: 'sections/later.tex' })];
   emitter.fire();
-  await until(() => !!thread('t3') && !thread('t1'));
+  await until(() => !!thread('t3') && !thread('new-thread'));
 
   // no connection
   source.failing = true;
