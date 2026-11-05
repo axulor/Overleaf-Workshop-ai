@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { RemoteFileSystemProvider, parseUri } from '../core/remoteFileSystemProvider';
+import { CompileOutcome, RemoteFileSystemProvider, VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME } from '../consts';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
@@ -16,11 +16,38 @@ const severityMap: Record<string, vscode.DiagnosticSeverity> = {
 // Match the document class in the tex file
 const documentClassRegex = new RegExp(/\\documentclass(?:\[[^\[\]\{\}]*\])?\{([^\[\]\{\}]+)\}/);
 
+const RECOMPILE_FROM_SCRATCH = '从零重新编译';
+
+// Overleaf does not document its statuses. An unknown one is shown as it is.
+/* eslint-disable @typescript-eslint/naming-convention */
+const COMPILE_STATUS_MESSAGES: {[status:string]: string} = {
+    'failure': 'LaTeX 有错误，没有生成 PDF。错误已列在“问题”面板中。',
+    'timedout': '编译超时，超过了 Overleaf 的编译时限（免费版为 10 秒）。',
+    'too-recently-compiled': '编译太频繁，Overleaf 要求稍等片刻再编译。',
+    'autocompile-backoff': 'Overleaf 暂时限制了自动编译，请手动编译或稍后再试。',
+    'compile-in-progress': '上一次编译还在进行中。',
+    'terminated': '编译被中止了。',
+    'stopped': '编译被中止了。',
+    'project-too-large': '项目太大，超过了 Overleaf 的编译限制。',
+    'validation-problems': '项目文件有问题，Overleaf 拒绝编译。',
+    'unavailable': 'Overleaf 的编译服务暂时不可用，请稍后再试。',
+    'clsi-maintenance': 'Overleaf 的编译服务正在维护，请稍后再试。',
+    'no-root-doc': '没有找到主文档。请点状态栏里的编译器名称，在 Setting: Main Document 中选择。',
+    'request-failed': '编译请求失败。',
+};
+/* eslint-enable @typescript-eslint/naming-convention */
+
 const pdfViewRecord: {
     [key: string]: {
         [key: string]: { doc: PdfDocument, webviewPanel: vscode.WebviewPanel }
     }
 } = {};
+
+interface CompileLogSummary {
+    available: boolean;
+    errors: string[];
+    warningCount: number;
+}
 
 class CompileDiagnosticProvider {
     private diagnosticCollection = vscode.languages.createDiagnosticCollection(ROOT_NAME);
@@ -64,20 +91,34 @@ class CompileDiagnosticProvider {
         return path;
     }
 
-    private async updateDiagnostics(uri: vscode.Uri) {
+    async updateDiagnostics(uri: vscode.Uri): Promise<CompileLogSummary> {
         this.diagnosticCollection.clear();
         const vfs = await this.vfsm.prefetch(uri);
         const logPath = `${OUTPUT_FOLDER_NAME}/output.log`;
         const _uri = vfs.pathToUri(logPath);
         let content ='';
-        content = new TextDecoder().decode(await vfs.openFile(_uri));
+        try {
+            content = new TextDecoder().decode(await vfs.openFile(_uri));
+        } catch (error) {
+            content = '';
+        }
+        // A log that could not be downloaded says nothing about the manuscript.
+        if (content === '') {
+            return {available: false, errors: [], warningCount: 0};
+        }
         const logs = new LatexParser(content).parse();
         if (logs === undefined) {
-            return content === ''? true :false;
+            return {available: true, errors: [], warningCount: 0};
         }
-        let hasError = false;
+        const errors: string[] = [];
+        let warningCount = 0;
         const diagnosticsRecorder: { [key: string]: vscode.Diagnostic[] } = {};
         for (const log of logs.all) {
+            if (log.level === 'error') {
+                errors.push(`${log.file}:${log.line} ${log.message}`);
+            } else if (log.level === 'warning') {
+                warningCount++;
+            }
             if (!log.file.startsWith('./')) { continue; }
             const path = this.validatePath(log.file);
             const range = await this.getRange(log, path, vfs);
@@ -90,17 +131,13 @@ class CompileDiagnosticProvider {
             const diagnostic = new vscode.Diagnostic(range, log.message, severityMap[log.level]);
             diagnostic.source = vscode.l10n.t('Compile Checker');
             diagnosticsRecorder[path].push(diagnostic);
-
-            if (log.level === 'error') {
-                hasError = true;
-            }
         }
         for (const file in diagnosticsRecorder) {
             const diagnostics = diagnosticsRecorder[file];
             const _uri = vfs.pathToUri(file);
             this.diagnosticCollection.set(_uri, diagnostics);
         }
-        return hasError;
+        return {available: true, errors, warningCount};
     }
 
     get triggers() {
@@ -119,6 +156,7 @@ export class CompileManager {
     private diagnosticProvider: CompileDiagnosticProvider;
     private compileAsDraft: boolean = false;
     private compileStopOnFirstError: boolean = false;
+    private log = vscode.window.createOutputChannel('Overleaf Workshop AI', {log: true});
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -155,7 +193,7 @@ export class CompileManager {
         return undefined;
     }
 
-    async update(status: 'success'|'compiling'|'failed'|'alert') {
+    async update(status: 'success'|'hasErrors'|'compiling'|'failed'|'alert') {
         const uri = await CompileManager.check();
         if (uri) {
             this.inCompiling = status === 'compiling';
@@ -168,6 +206,12 @@ export class CompileManager {
                         this.status.text = `${compilerName}`;
                         this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **${vscode.l10n.t('Compile Success')}**`);
                         this.status.backgroundColor = undefined;
+                        break;
+                    case 'hasErrors':
+                        // Like Overleaf's own page: LaTeX carried on past the errors, so there is a PDF to look at.
+                        this.status.text = `${compilerName} $(warning)`;
+                        this.status.tooltip.appendMarkdown(`\`${rootDocName}\` **已生成 PDF，但日志里有 LaTeX 错误，详情见“问题”面板**`);
+                        this.status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
                         break;
                     case 'compiling':
                         this.status.text = `${compilerName} $(sync~spin)`;
@@ -199,49 +243,97 @@ export class CompileManager {
         await vscode.workspace.saveAll(); // save all dirty files
 
         const uri = await this.update('compiling');
-        if (uri) {
-            this.vfsm.prefetch(uri)
-                .then(async (vfs) => {
-                    const content = new TextDecoder().decode( await vfs?.openFile(uri) );
-                    const match = RegExp(documentClassRegex).exec(content);
-                    const fileId = (await vfs._resolveUri(uri)).fileId;
-                    const rootDocId = match ? fileId : undefined;
-                    return await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
-                })
-                .then(async (res) => {
-                    switch (res) {
-                        case undefined:
-                            await this.update('success');
-                            break;
-                        case false:
-                            await this.update('failed');
-                            break;
-                        case true:
-                            return true;
-                        default:
-                            await this.update('alert');
-                            break;
-                    }
-                })
-                .then(status =>
-                    status ?
-                        vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compileErrorCheck`, uri)
-                        : Promise.reject()
-                )
-                .then(async (hasError) => {
-                    if (hasError) {
-                        await this.update('failed');
-                    } else {
-                        await this.update('success');
-                    }
-                    // refresh pdf
-                    const { identifier } = parseUri(uri);
-                    pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
-                        (record) => record.doc.refresh()
-                    );
-                });
+        if (!uri) { return; }
 
+        try {
+            const vfs = await this.vfsm.prefetch(uri);
+            const rootDocId = await this.detectRootDoc(vfs, uri);
+            const outcome = await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
+            if (outcome===undefined) {
+                await this.update('success');
+                return;
+            }
+
+            const logSummary = outcome.hasLog ? await this.diagnosticProvider.updateDiagnostics(uri) : undefined;
+            this.report(outcome, force, logSummary);
+            if (outcome.status==='request-failed') {
+                await this.update('alert');
+                return;
+            }
+            if (outcome.status!=='success') {
+                await this.update('failed');
+            } else {
+                await this.update(logSummary?.errors.length ? 'hasErrors' : 'success');
+            }
+            if (outcome.hasPdf) {
+                const { identifier } = parseUri(uri);
+                pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
+                    (record) => record.doc.refresh()
+                );
+                // A manual compile is a request to see the result, as on Overleaf's own page.
+                if (force && !this.isPdfOpen(uri)) {
+                    await this.openPdf(true);
+                }
+            }
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            this.log.error(`Compile stopped by an error: ${reason}`);
+            if (force) {
+                this.showCompileProblem(`编译时出错：${reason}`);
+            }
+            await this.update('failed');
+        } finally {
+            // Whatever happened, a later compile must not be ignored as "already compiling".
+            this.inCompiling = false;
         }
+    }
+
+    /** The active document is the main document if it has \documentclass; anything else uses the project's setting. */
+    private async detectRootDoc(vfs: VirtualFileSystem, uri: vscode.Uri) {
+        const { fileType, fileId } = await vfs._resolveUri(uri);
+        if (fileType!=='doc') { return undefined; }
+        const content = new TextDecoder().decode( await vfs.openFile(uri) );
+        return documentClassRegex.test(content) ? fileId : undefined;
+    }
+
+    private isPdfOpen(uri: vscode.Uri) {
+        const { identifier } = parseUri(uri);
+        return vscode.window.tabGroups.all.some((group) => group.tabs.some((tab) => {
+            const input = tab.input;
+            return input instanceof vscode.TabInputCustom
+                && input.viewType===`${ROOT_NAME}.pdfViewer`
+                && parseUri(input.uri).identifier===identifier;
+        }));
+    }
+
+    private report(outcome: CompileOutcome, manual: boolean, logSummary?: CompileLogSummary) {
+        let summary = `${manual ? 'Manual' : 'Auto'} compile of ${outcome.rootResourcePath ?? '(no main document)'}: `
+            + `${outcome.status}, ${outcome.elapsedMs} ms, log ${outcome.hasLog}, pdf ${outcome.hasPdf}`
+            + (outcome.message ? `, ${outcome.message}` : '');
+        if (logSummary && !logSummary.available) {
+            summary += ', the log could not be downloaded';
+        } else if (logSummary) {
+            summary += `, LaTeX errors ${logSummary.errors.length}, warnings ${logSummary.warningCount}`;
+            if (logSummary.errors.length > 0) {
+                summary += `, first error: ${logSummary.errors[0]}`;
+            }
+        }
+        if (outcome.status==='success') {
+            this.log.info(summary);
+            return;
+        }
+        this.log.warn(summary);
+        if (manual) {
+            const explanation = COMPILE_STATUS_MESSAGES[outcome.status] ?? `编译没有成功，Overleaf 返回的状态是 ${outcome.status}。`;
+            this.showCompileProblem(outcome.message ? `${explanation}（${outcome.message}）` : explanation);
+        }
+    }
+
+    private showCompileProblem(message: string) {
+        const viewRecord = '查看记录';
+        vscode.window.showErrorMessage(message, viewRecord).then((choice) => {
+            if (choice===viewRecord) { this.log.show(); }
+        });
     }
 
     async stopCompile() {
@@ -253,7 +345,7 @@ export class CompileManager {
         }
     }
 
-    async openPdf() {
+    async openPdf(preserveFocus:boolean=false) {
         const uri = await CompileManager.check();
         if (uri) {
             const rootPath = uri.path.split('/', 2)[1];
@@ -262,7 +354,7 @@ export class CompileManager {
             });
             vscode.commands.executeCommand('vscode.openWith', pdfUri,
                 `${ROOT_NAME}.pdfViewer`,
-                { preview: false, viewColumn: vscode.ViewColumn.Beside }
+                { preview: false, viewColumn: vscode.ViewColumn.Beside, preserveFocus }
             );
         }
     }
@@ -410,6 +502,7 @@ export class CompileManager {
         const currentDraftMode = this.compileAsDraft ? vscode.l10n.t('Draft Mode') : vscode.l10n.t('Normal Mode');
         const currentStopOnError = this.compileStopOnFirstError ? vscode.l10n.t('Stop on first error') : vscode.l10n.t('Try to compile despite errors');
         const settingItems = [
+            {label: RECOMPILE_FROM_SCRATCH, description: '清空 Overleaf 上的编译缓存后再编译，耗时更长'},
             {label: vscode.l10n.t('Compile Mode'), description: currentDraftMode},
             {label: vscode.l10n.t('Compile Error Handling'), description: currentStopOnError},
             {label: '', kind: vscode.QuickPickItemKind.Separator},
@@ -422,6 +515,12 @@ export class CompileManager {
 
         const setting = await vscode.window.showQuickPick(settingItems);
         switch (setting?.label) {
+            case RECOMPILE_FROM_SCRATCH:
+                if (vfs) {
+                    await vfs.clearCompileCache();
+                    this.compile(true);
+                }
+                break;
             case vscode.l10n.t('Setting: Compiler'):
                 this.setCompiler();
                 break;
@@ -448,6 +547,7 @@ export class CompileManager {
         return [
             // register status bar
             this.status,
+            this.log,
             // register compile commands
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, () => this.compile(true)),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),

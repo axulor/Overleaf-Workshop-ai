@@ -27,7 +27,8 @@ export interface NewProjectResponseSchema {
 }
 
 export interface CompileResponseSchema {
-    status: 'success' | 'failure' | 'error';
+    /** 'success', 'failure', 'timedout', 'too-recently-compiled' and others; Overleaf does not document the list. */
+    status: string;
     compileGroup: string;
     clsiServerId?: string;
     pdfDownloadDomain?: string;
@@ -660,7 +661,7 @@ export class BaseAPI {
     }
 
     async compile(identity:Identity, projectId:string, rootResourcePath:string|null,
-        draft:boolean=false, stopOnFirstError:boolean=false
+        draft:boolean=false, stopOnFirstError:boolean=false, autoCompile:boolean=false
     ) {
         const body = {
             check: 'silent',
@@ -671,7 +672,8 @@ export class BaseAPI {
         };
 
         this.setIdentity(identity);
-        return this.request('POST', `project/${projectId}/compile?auto_compile=true`, body, (res) => {
+        const query = autoCompile ? '?auto_compile=true' : '';
+        return this.request('POST', `project/${projectId}/compile${query}`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return {compile};
         }, {'X-Csrf-Token': identity.csrfToken});

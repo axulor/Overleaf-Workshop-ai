@@ -106,6 +106,16 @@ export function parseUri(uri: vscode.Uri) {
     return {userId, projectId, serverName, projectName, identifier, pathParts};
 }
 
+export interface CompileOutcome {
+    /** Overleaf's status, or 'no-root-doc' or 'request-failed' when no compile could run. */
+    status: string;
+    message?: string;
+    rootResourcePath: string|null;
+    elapsedMs: number;
+    hasLog: boolean;
+    hasPdf: boolean;
+}
+
 export class VirtualFileSystem extends vscode.Disposable {
     private root?: ProjectEntity;
     private currentVersion?: number;
@@ -966,48 +976,63 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string) {
-        if (force || (this.root && this.isDirty)) {
-            this.isDirty = false;
-            let needCacheClearFirst = false;
-            try{
-                await this.resolve(this.pathToUri(OUTPUT_FOLDER_NAME, "output.log"));
-            }
-            catch (e) {
-                needCacheClearFirst = true;
-            }
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            // clear cache if needed
-            if (needCacheClearFirst) {
-                await this.api.deleteAuxFiles(identity, this.projectId);
-            }
-            // compile project
-            const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id ?? null;
-            let rootResourcePath: string | null = null;
-            if (resolvedRootDocId) {
-                const rootEntry = this._resolveById(resolvedRootDocId);
-                if (rootEntry?.path) {
-                    rootResourcePath = rootEntry.path.replace(/^\//, '');
-                } else {
-                    console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
-                }
-            }
-            const res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError);
-            if (res.type==='success' && res.compile?.status==='success') {
-                // Store CDN download info from the response for subsequent output file requests
-                this.compileGroup = res.compile.compileGroup;
-                this.clsiServerId = res.compile.clsiServerId;
-                this.pdfDownloadDomain = res.compile.pdfDownloadDomain;
-                this.updateOutputs(res.compile.outputFiles);
-                return true;
-            } else {
-                if (res.message!==undefined) {
-                    console.error('Compile failure.', res.message);
-                }
-                return false;
-            }
+    /**
+     * Compiles the project on Overleaf's server. A forced compile is a manual one.
+     * Returns undefined when there is nothing to compile, otherwise what happened and why.
+     */
+    async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string): Promise<CompileOutcome|undefined> {
+        if (!force && !(this.root && this.isDirty)) {
+            return undefined;
         }
-        return Promise.resolve(undefined);
+        this.isDirty = false;
+
+        const startedAt = Date.now();
+        await this.init();
+        const rootResourcePath = this.resolveCompileRoot(rootDocId);
+        const outcome = (status:string, message?:string, outputs:Array<OutputFileEntity>=[]): CompileOutcome => ({
+            status, message, rootResourcePath,
+            elapsedMs: Date.now() - startedAt,
+            hasLog: outputs.some((file) => file.path==='output.log'),
+            hasPdf: outputs.some((file) => file.path==='output.pdf'),
+        });
+        if (rootResourcePath===null) {
+            return outcome('no-root-doc');
+        }
+
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError, !force);
+        if (res.type!=='success' || res.compile===undefined) {
+            return outcome('request-failed', res.message);
+        }
+
+        // A failed compile still comes with a log, which is the only explanation of what went wrong.
+        const outputs = res.compile.outputFiles ?? [];
+        if (outputs.length > 0) {
+            // Store CDN download info from the response for subsequent output file requests
+            this.compileGroup = res.compile.compileGroup;
+            this.clsiServerId = res.compile.clsiServerId;
+            this.pdfDownloadDomain = res.compile.pdfDownloadDomain;
+            await this.updateOutputs(outputs);
+        }
+        return outcome(res.compile.status, undefined, outputs);
+    }
+
+    /** Overleaf needs a path to compile, and a project may have no main document set. */
+    private resolveCompileRoot(rootDocId?:string): string|null {
+        const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id;
+        const rootEntry = resolvedRootDocId ? this._resolveById(resolvedRootDocId) : undefined;
+        if (rootEntry?.path) {
+            return rootEntry.path.replace(/^\//, '');
+        }
+        const candidates = this.getValidMainDocs();
+        const chosen = candidates.find((doc) => doc.path==='/main.tex') ?? (candidates.length===1 ? candidates[0] : undefined);
+        return chosen ? chosen.path.replace(/^\//, '') : null;
+    }
+
+    /** Deletes the build cache on Overleaf, so that the next compile starts from scratch. */
+    async clearCompileCache() {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        return this.api.deleteAuxFiles(identity, this.projectId);
     }
 
     async stopCompile() {

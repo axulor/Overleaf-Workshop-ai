@@ -1,9 +1,22 @@
-# Overleaf Workshop
+# Overleaf Workshop AI
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/overleaf-workshop/Overleaf-Workshop)](https://github.com/overleaf-workshop/Overleaf-Workshop)
-[![version](https://vsmarketplacebadges.dev/version-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
-[![installs](https://vsmarketplacebadges.dev/installs-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
-[![rating](https://vsmarketplacebadges.dev/rating-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop&ssr=false#review-details)
+An unofficial fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop) by iamhyc and contributors, under the same AGPL-3.0 license. It is not affiliated with Overleaf or with the original project, and it cannot run alongside the original extension: disable that one first.
+
+The goal is to work on an Overleaf project from a real local folder, with AI coding assistants editing the files directly and changes reaching Overleaf in real time. That work is in progress. So far this fork changes how compiling works:
+
+- A PDF with LaTeX errors in its log no longer shows as a failed compile. As on Overleaf's own page, the PDF is available and the errors are listed in the Problems panel.
+- A manual compile opens the PDF beside the editor.
+- A failed compile says why, keeps its log, and each compile is recorded in the `Overleaf Workshop AI` output channel.
+- The build cache is no longer cleared automatically. The option to recompile from scratch is in the compile settings menu.
+- A manual compile is no longer sent to Overleaf as an auto-compile.
+- An error during a compile no longer blocks later compiles until the window is reloaded.
+- A project with no main document set uses `main.tex` or its only `.tex` file, and asks if neither applies.
+
+To run the tests, which use fake Overleaf responses and need no account: `powershell -NoProfile -ExecutionPolicy Bypass -File test\run.ps1`. To try this build against a real account without touching your own VS Code: `test\dev-window.ps1`.
+
+The rest of this document is from the original project.
+
+---
 
 Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
 

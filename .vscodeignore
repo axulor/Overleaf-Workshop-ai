@@ -22,3 +22,9 @@ views/pdf-viewer/vendor/web/standard_fonts
 
 views/chat-view/**
 !views/chat-view/dist/**
+test/**
+.husky/**
+.github/**
+commitlint.config.js
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md

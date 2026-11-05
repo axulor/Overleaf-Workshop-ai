@@ -1,14 +1,15 @@
 {
-  "name": "overleaf-workshop",
+  "name": "overleaf-workshop-ai",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.10",
+  "version": "0.1.0",
   "icon": "resources/icons/app_icon.png",
+  "license": "AGPL-3.0-only",
   "author": {
     "name": "iamhyc",
     "email": "ychong@petalmail.com"
   },
-  "publisher": "iamhyc",
+  "publisher": "axulor",
   "contributors": [
     {
       "name": "iamhyc",
@@ -47,10 +48,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/overleaf-workshop/overleaf-workshop"
+    "url": "https://github.com/axulor/Overleaf-Workshop-ai"
   },
   "bugs": {
-    "url": "https://github.com/overleaf-workshop/overleaf-workshop/issues"
+    "url": "https://github.com/axulor/Overleaf-Workshop-ai/issues"
   },
   "engines": {
     "vscode": "^1.80.0"
