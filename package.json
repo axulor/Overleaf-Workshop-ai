@@ -2,7 +2,7 @@
   "name": "overleaf-workshop-ai",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "icon": "resources/icons/app_icon.png",
   "license": "AGPL-3.0-only",
   "author": {
@@ -417,7 +417,7 @@
       },
       {
         "command": "overleaf-workshop.compileManager.syncCode",
-        "title": "%commands.compileManager.syncCode.title%",
+        "title": "跳到 PDF 对应位置",
         "enablement": "editorTextFocus && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
         "category": "%extension.displayName%"
       },
@@ -732,6 +732,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "overleaf-workshop.compileManager.syncCode",
+          "group": "navigation@9",
+          "when": "resourceExtname == .tex && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile)"
+        },
         {
           "command": "overleaf-workshop.sync.addCommentOnSelection",
           "group": "1_modification@0",

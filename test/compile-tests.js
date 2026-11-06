@@ -279,6 +279,137 @@ async function testManager(CompileManager) {
   check('nothing to compile leaves it ready', manager.inCompiling === false);
 }
 
+/** Jumping between the code and the PDF from a synced folder. Runs first, before anything opens an online file. */
+async function testJumps(CompileManager, LocalReplicaSCMProvider, EventBus) {
+  // Opening a .tex file wakes the plugin itself, whose sync finds this folder, sees no login and holds connections
+  // back. That is right for it, and says nothing about jumping, so here the folder stays available.
+  Object.defineProperty(LocalReplicaSCMProvider, 'detached', { configurable: true, get: () => false, set: () => {} });
+  const root = vscode.workspace.workspaceFolders[0].uri.fsPath;
+  const folder = path.join(root, 'overleaf-Test');
+  const main = path.join(folder, 'main.tex');
+  const part = path.join(folder, 'sections', 'part two.tex');
+  fs.mkdirSync(path.join(folder, '.overleaf'), { recursive: true });
+  fs.mkdirSync(path.join(folder, 'sections'), { recursive: true });
+  fs.writeFileSync(path.join(folder, '.overleaf', 'settings.json'), JSON.stringify({ uri: ORIGIN.toString(), enableCompileNPreview: true }));
+  fs.writeFileSync(main, 'first\nsecond\nthird\nfourth\n');
+  fs.writeFileSync(part, 'one\ntwo\nthree\n');
+  LocalReplicaSCMProvider.forgetProjectRoot();
+  const same = (a, b) => a?.toLowerCase() === b.toLowerCase();
+
+  const asked = [];
+  const posted = [];
+  const revealed = [];
+  let position = [{ page: 3, h: 100, v: 200 }];
+  let target = { file: 'main.tex', line: 2, column: 0 };
+  const vfs = {
+    syncCode: async (...args) => { asked.push(args); return position; },
+    syncPdf: async () => target,
+    pathToUri: (...parts) => vscode.Uri.joinPath(ORIGIN, ...parts),
+    openFile: async () => new TextEncoder().encode(LOG_WITH_ERROR),
+  };
+  const manager = new CompileManager({ prefetch: async () => vfs });
+  const pdfUri = vscode.Uri.joinPath(ORIGIN, '.output', 'output.pdf');
+  let closePanel;
+  const openPanel = () => EventBus.fire('pdfWillOpenEvent', {
+    uri: pdfUri,
+    doc: {},
+    webviewPanel: {
+      viewColumn: 2,
+      webview: { postMessage: async (message) => { posted.push(message); return true; } },
+      reveal: (column, preserveFocus) => { revealed.push({ column, preserveFocus }); },
+      onDidDispose: (listener) => { closePanel = listener; },
+    },
+  });
+  openPanel();
+
+  const inEditor = async (file, line, character = 0) => {
+    const editor = await vscode.window.showTextDocument(vscode.Uri.file(file));
+    editor.selection = new vscode.Selection(line, character, line, character);
+    return editor;
+  };
+
+  // from the code to the PDF
+  await inEditor(main, 2, 1);
+  await manager.syncCode();
+  check('to the PDF: from a local file, it names that file', asked.at(-1)?.[0] === 'main.tex', JSON.stringify(asked.at(-1)));
+  check('to the PDF: counting lines from 1, as the server does', asked.at(-1)?.[1] === 3 && asked.at(-1)?.[2] === 1, JSON.stringify(asked.at(-1)));
+  check('to the PDF: the PDF is told where to go', posted.at(-1)?.type === 'syncCode' && posted.at(-1)?.content === position);
+  check('to the PDF: it is brought to the front without taking the keyboard', revealed.at(-1)?.column === 2 && revealed.at(-1)?.preserveFocus === true, JSON.stringify(revealed));
+
+  await inEditor(part, 1);
+  await manager.syncCode();
+  check('to the PDF: from a file in a folder, with a space in its name', asked.at(-1)?.[0] === 'sections/part two.tex' && asked.at(-1)?.[1] === 2, JSON.stringify(asked.at(-1)));
+
+  // a file next to the project
+  const beside = path.join(root, 'beside.tex');
+  fs.writeFileSync(beside, 'not in the project\n');
+  const askedBefore = asked.length;
+  const postedBefore = posted.length;
+  await inEditor(beside, 0);
+  await manager.syncCode();
+  check('to the PDF: a file next to the project is not asked about', asked.length === askedBefore && posted.length === postedBefore);
+  await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  fs.rmSync(beside);
+
+  // nothing found, or the request failing
+  await inEditor(main, 0);
+  position = [];
+  await manager.syncCode();
+  check('to the PDF: with no such place, the PDF stays where it is', posted.length === postedBefore);
+  position = undefined;
+  await manager.syncCode();
+  check('to the PDF: with a failed request too', posted.length === postedBefore);
+  position = [{ page: 3, h: 100, v: 200 }];
+
+  // the PDF closed
+  closePanel();
+  const opened = [];
+  const realOpen = manager.openPdf;
+  manager.openPdf = async (preserveFocus) => { opened.push(preserveFocus); openPanel(); };
+  await manager.syncCode();
+  check('to the PDF: a closed PDF is opened, without taking the keyboard', opened.length === 1 && opened[0] === true, JSON.stringify(opened));
+  check('to the PDF: and is told where to go', posted.length === postedBefore + 1);
+  await manager.syncCode();
+  check('to the PDF: one already open is not opened again', opened.length === 1);
+  manager.openPdf = realOpen;
+
+  // from the PDF to the code
+  await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+  target = { file: 'main.tex', line: 2, column: 0 };
+  await manager.syncPdf({ page: 1, h: 1, v: 1, identifier: 'second' });
+  let landed = vscode.window.activeTextEditor;
+  check('to the code: opens the real local file', landed?.document.uri.scheme === 'file' && same(landed?.document.uri.fsPath, main), landed?.document.uri.toString());
+  check('to the code: at the line the server named', landed?.selection.active.line === 1, String(landed?.selection.active.line));
+
+  target = { file: 'sections/part two.tex', line: 3, column: 0 };
+  await manager.syncPdf({ page: 1, h: 1, v: 1, identifier: 'three' });
+  landed = vscode.window.activeTextEditor;
+  check('to the code: opens another local file', landed?.document.uri.scheme === 'file' && same(landed?.document.uri.fsPath, part), landed?.document.uri.toString());
+  check('to the code: at its line', landed?.selection.active.line === 2, String(landed?.selection.active.line));
+
+  await vscode.window.showTextDocument(vscode.Uri.file(main));
+  target = { file: 'main.tex', line: 4, column: 0 };
+  await manager.syncPdf({ page: 1, h: 1, v: 1, identifier: 'fourth' });
+  const tabsOnMain = vscode.window.tabGroups.all.flatMap((g) => g.tabs).filter((t) => t.input instanceof vscode.TabInputText && same(t.input.uri.fsPath, main));
+  check('to the code: a file already open is not opened twice', tabsOnMain.length === 1, String(tabsOnMain.length));
+  check('to the code: nothing online was opened', vscode.window.tabGroups.all.flatMap((g) => g.tabs).every((t) => !(t.input instanceof vscode.TabInputText) || t.input.uri.scheme === 'file'));
+
+  // compile errors
+  const summary = await manager.diagnosticProvider.updateDiagnostics(ORIGIN);
+  check('a compile error: reported', summary.errors.length === 1, JSON.stringify(summary));
+  const onLocal = vscode.languages.getDiagnostics(vscode.Uri.file(main));
+  check('a compile error: shown on the real local file', onLocal.some((d) => /Undefined control sequence/.test(d.message)), JSON.stringify(onLocal.map((d) => d.message)));
+  check('a compile error: at its line', onLocal.find((d) => /Undefined control sequence/.test(d.message))?.range.start.line === 2);
+  check('a compile error: not on an online copy', vscode.languages.getDiagnostics().every(([uri, list]) => uri.scheme === 'file' || list.length === 0));
+  manager.diagnosticProvider.diagnosticCollection.clear();
+
+  closePanel(); // the record of open PDFs is shared, and a later compile would refresh this pretend one
+  await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+  fs.rmSync(folder, { recursive: true, force: true });
+  LocalReplicaSCMProvider.forgetProjectRoot();
+  Object.defineProperty(LocalReplicaSCMProvider, 'detached', { configurable: true, writable: true, value: false });
+}
+
 exports.run = async function () {
   try {
     const { BaseAPI } = require(path.join(out, 'api', 'base.js'));
@@ -287,6 +418,7 @@ exports.run = async function () {
     const { CompileManager } = require(path.join(out, 'compile', 'compileManager.js'));
     GlobalStateManager.authenticate = async () => ({ cookies: 'x=y', csrfToken: 't' });
 
+    await testJumps(CompileManager, require(path.join(out, 'scm', 'localReplicaSCM.js')).LocalReplicaSCMProvider, require(path.join(out, 'utils', 'eventBus.js')).EventBus);
     await testApi(BaseAPI);
     await testVfs(provider.VirtualFileSystem);
     await testManager(CompileManager);

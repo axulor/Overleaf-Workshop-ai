@@ -107,9 +107,11 @@ my-paper/                    在 VS Code 里打开这一层
 |---|---|
 | 在 Overleaf 上编译（也可以点标题栏带圆圈的 ▶） | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> |
 | 查看 PDF | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> |
-| 从代码跳到 PDF（在 PDF 上双击可以跳回代码） | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd> |
+| 从代码跳到 PDF（也可以在 tex 里右键选 `跳到 PDF 对应位置`） | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd> |
+| 从 PDF 跳回代码 | 双击 PDF 上的位置 |
 
 - 编译前会先把本地修改全部发出去，手动编译后在旁边打开 PDF。
+- 两个方向的跳转都定位到本地文件，子文件夹里的文件也可以。跳到 PDF 时，目标位置会缓慢闪一下黄色；PDF 关着时会自动打开，光标留在 tex 里。
 - PDF 和日志保存在 `overleaf-<项目名>/.output/`。
 - 和网页一样，日志里有 LaTeX 错误但生成了 PDF 时不算失败：状态栏显示警告，错误列在“问题”面板。
 - 失败时会说明原因（比如超时，免费版的时限约为 10 秒），每次编译都记录在 `Overleaf Workshop AI` 输出通道。
@@ -173,6 +175,7 @@ Overleaf 上的批注显示在对应的文字旁和 VS Code 的批注面板里�
 - **`Ctrl+Z` 可能撤销合作者的修改。** 线上的修改会进入编辑器的撤销记录，连续撤销时可能把别人刚写的也撤掉，撤销结果同样会同步。
 - **保存时自动格式化也会生效。** 打字会自动保存，开启了 `editor.formatOnSave` 或 `files.trimTrailingWhitespace` 的话，每次停顿都可能改动文件并同步给合作者，建议在这个工作区关闭。
 - **只有大小写不同的文件名**（`Intro.tex` 和 `intro.tex`）在 Windows 上是同一个文件，请避免。
+- **被 `\input` 引入的文件，文件名不要带空格。** 否则从 PDF 跳回时，Overleaf 返回的是 `main.tex`，会跳错文件。从代码跳到 PDF 不受影响。
 - **这是非官方工具。** 它使用 Overleaf 网页版自己的接口，这些接口可能随时变化，Overleaf 的使用条款也对脚本化访问有限制，请自行判断。这个分支与 Overleaf 官方和原项目都没有关系。
 - **出错时可以回退。** Overleaf 自带的历史记录（History）可以恢复任何版本。第一次用在重要项目上时，建议先在历史记录里加一个标签。
 

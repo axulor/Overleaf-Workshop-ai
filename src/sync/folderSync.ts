@@ -172,6 +172,7 @@ export class FolderSync implements vscode.Disposable {
     private onlineDeletes: string[] = [];
     private onlineDeleteTimer?: NodeJS.Timeout;
     private foldersDirty = false;
+    private savingManifest: Promise<void> = Promise.resolve();
     /** A deletion was turned down, so the empty folders that went with the files come back too. */
     private restoringFolders = false;
     private stopping = false;
@@ -1334,13 +1335,25 @@ export class FolderSync implements vscode.Disposable {
         return !(this.disposed && !this.stopping) && await this.isStillLinked();
     }
 
-    private async saveManifest() {
+    /** One at a time, as they share a temporary file, which the first would have moved away from under the second. */
+    private saveManifest(): Promise<void> {
+        const saved = this.savingManifest.catch(() => {}).then(() => this.writeManifest());
+        this.savingManifest = saved;
+        return saved;
+    }
+
+    private async writeManifest() {
         if (!this.manifestChanged || !await this.mayWrite()) { return; }
-        this.manifest.held = [...this.heldCopies];
-        const temporary = vscode.Uri.joinPath(this.stateDir, 'manifest.json.saving');
-        await vscode.workspace.fs.writeFile(temporary, new TextEncoder().encode(JSON.stringify(this.manifest, null, 1)));
-        await vscode.workspace.fs.rename(temporary, this.manifestUri, { overwrite: true });
-        this.manifestChanged = false;
+        this.manifestChanged = false; // before writing, so that a change made meanwhile is saved next time
+        try {
+            this.manifest.held = [...this.heldCopies];
+            const temporary = vscode.Uri.joinPath(this.stateDir, 'manifest.json.saving');
+            await vscode.workspace.fs.writeFile(temporary, new TextEncoder().encode(JSON.stringify(this.manifest, null, 1)));
+            await vscode.workspace.fs.rename(temporary, this.manifestUri, { overwrite: true });
+        } catch (error) {
+            this.manifestChanged = true;
+            throw error;
+        }
     }
 
     private report(message: string) {

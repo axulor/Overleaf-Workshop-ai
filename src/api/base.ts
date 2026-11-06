@@ -205,7 +205,7 @@ export interface ResponseSchema {
     compile?: CompileResponseSchema;
     content?: Uint8Array;
     syncPdf?: SyncPdfResponseSchema;
-    syncCode?: SyncCodeResponseSchema;
+    syncCode?: SyncCodeResponseSchema['pdf'];
     meta?: MetadataResponseScheme;
     misspellings?: MisspellingItemSchema[];
     tags?: ProjectTagsResponseSchema[];
@@ -834,9 +834,9 @@ export class BaseAPI {
 
     async proxySyncCode(identity:Identity, projectId:string, file:string, line:number, column:number, buildId:string) {
         this.setIdentity(identity);
-        return this.request('GET', `project/${projectId}/sync/code?file=${file}&line=${line}&column=${column}&editorId=${uuidv4()}&buildId=${buildId}`,
+        return this.request('GET', `project/${projectId}/sync/code?file=${encodeURIComponent(file)}&line=${line}&column=${column}&editorId=${uuidv4()}&buildId=${buildId}`,
                             undefined, (res) => {
-                                const syncCode = (JSON.parse(res!) as any).pdf as SyncCodeResponseSchema;
+                                const syncCode = (JSON.parse(res!) as SyncCodeResponseSchema).pdf;
                                 return {syncCode};
                             });
     }

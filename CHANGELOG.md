@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This fork has its own version numbers, starting from Overleaf Workshop 0.15.10. Entries below this section are from the original project.
 
+### [0.7.1] - 2026-11-06
+Jumping between the code and the PDF from a synced folder, checked on real Overleaf with the real shortcut.
+- Double-clicking the PDF opens the real local file. Before this, it opened a second tab of the online copy, without the section names and anything else VS Code knows about the local file.
+- Jump to PDF works from a local file, including one in a subfolder. Before this, it sent no file name there, which the server refuses, and it only worked from the online copy.
+- Jump to PDF goes to the line the cursor is on, instead of the one above, and places it at the same height at any zoom.
+- The place jumped to in the PDF flashes yellow and fades, as scrolling alone does not say which line it was.
+- A closed PDF is opened for the jump, and one behind another tab is brought forward, with the keyboard staying in the editor.
+- Compile errors in the Problems panel are on the local file, so clicking one goes there.
+- Jump to PDF is also on the editor's right-click menu.
+
+Also fixed: saving the sync records from two places at once could fail, for example on choosing a side in a conflict while a file was syncing, and a change made during a save could go unsaved until the next one.
+
 ### [0.7.0] - 2026-11-06
 What happens to the project on either side now carries through to the other. Each rule was checked on real Overleaf, with a temporary project made for it and permanently deleted afterwards.
 - Deleting the whole local folder no longer touches the online project and asks nothing: syncing simply stops, and nothing brings the folder back. Restoring the folder from the recycle bin resumes syncing.

@@ -1,5 +1,8 @@
 # Runs the tests in an isolated VS Code. They use a fake Overleaf and need no account.
-param([string]$ExtensionDir = (Split-Path -Parent $PSScriptRoot))
+param(
+  [string]$ExtensionDir = (Split-Path -Parent $PSScriptRoot),
+  [string[]]$Suites = @('compile-tests.js', 'sync-tests.js', 'activation-tests.js')
+)
 
 $run = Join-Path $PSScriptRoot '.run'
 $exe = Join-Path (Split-Path (Split-Path (Get-Command code).Source)) 'Code.exe'
@@ -10,7 +13,7 @@ Get-ChildItem Env: | Where-Object { $_.Name -like 'VSCODE_*' -or $_.Name -eq 'EL
 $env:OVERLEAF_AI_TEST_DIR = $run
 
 $failed = $false
-foreach ($suite in 'compile-tests.js', 'sync-tests.js', 'activation-tests.js') {
+foreach ($suite in $Suites) {
   "=== $suite ==="
   foreach ($d in 'user-data', 'extensions', 'workspace') {
     Remove-Item -LiteralPath (Join-Path $run $d) -Recurse -Force -ErrorAction SilentlyContinue

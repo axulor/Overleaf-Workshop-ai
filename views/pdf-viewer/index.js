@@ -37,6 +37,7 @@
         pdfSidebarView: SidebarView.NONE,
     };
     let firstLoaded = true;
+    let pendingSyncCode;
 
     function updatePdfViewerState() {
         const pdfViewerState = vscode.getState() || globalPdfViewerState;
@@ -163,6 +164,29 @@
         PDFViewerApplication.load(doc);
     }
 
+    /** Scrolling alone does not say which line it was, so the place flashes, and fades by itself. */
+    function flashTarget(pdf) {
+        document.querySelectorAll('.synctex-highlight').forEach((each) => each.remove());
+        for (const box of pdf) {
+            const page = document.getElementsByClassName('page')[box.page - 1];
+            if (page === null || page === undefined) {
+                continue;
+            }
+            const {viewport} = PDFViewerApplication.pdfViewer.getPageView(box.page - 1);
+            const pageHeight = viewport.viewBox[3];
+            const [x1, y1] = viewport.convertToViewportPoint(box.h, pageHeight - (box.v - box.height));
+            const [x2, y2] = viewport.convertToViewportPoint(box.h + box.width, pageHeight - box.v);
+            const element = document.createElement('div');
+            element.className = 'synctex-highlight';
+            element.style.left = `${Math.min(x1, x2) - 2}px`;
+            element.style.top = `${Math.min(y1, y2) - 2}px`;
+            element.style.width = `${Math.abs(x2 - x1) + 4}px`;
+            element.style.height = `${Math.abs(y2 - y1) + 4}px`;
+            element.addEventListener('animationend', () => element.remove());
+            page.appendChild(element);
+        }
+    }
+
     // Reference: https://github.com/James-Yu/LaTeX-Workshop/blob/master/viewer/latexworkshop.ts#L306
     function syncCode(pdf) {
         const _idx = Math.ceil(pdf.length / 2) - 1;
@@ -174,14 +198,16 @@
         const v = pdf[_idx].v;
         const page = document.getElementsByClassName('page')[pageNum - 1];
         if (page === null || page === undefined) {
+            pendingSyncCode = pdf; // still loading, as when this request is what opened the PDF
             return;
         }
         const {viewport} = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1);
-        let [left, top] = viewport.convertToPdfPoint(h , v);
+        // The server measures in PDF points from the page's top left. This is syncPdf below, in reverse, and holds at any zoom.
+        const [left, top] = viewport.convertToViewportPoint(h, viewport.viewBox[3] - v);
         let scrollX = page.offsetLeft + left;
         scrollX = Math.min(scrollX, maxScrollX);
         scrollX = Math.max(scrollX, minScrollX);
-        const scrollY = page.offsetTop + page.offsetHeight - top;
+        const scrollY = page.offsetTop + page.clientTop + top;
         if (PDFViewerApplication.pdfViewer.scrollMode === 1) {
             // horizontal scrolling
             container.scrollLeft = page.offsetLeft;
@@ -189,6 +215,7 @@
             // vertical scrolling
             container.scrollTop = scrollY - document.body.offsetHeight * 0.4;
         }
+        flashTarget(pdf);
         backupPdfViewerState();
     }
 
@@ -215,6 +242,12 @@
             const {eventBus, _boundEvents} = PDFViewerApplication;
             eventBus._off("beforeprint", _boundEvents.beforePrint);
             eventBus.on('documentloaded', updatePdfViewerState);
+            eventBus.on('pagesloaded', () => {
+                const pdf = pendingSyncCode;
+                pendingSyncCode = undefined;
+                // After the saved scroll position has been put back, which this should replace.
+                if (pdf) { setTimeout(() => syncCode(pdf), 300); }
+            });
             // backup scale
             eventBus._on('scalechanged', backupPdfViewerState);
             eventBus._on("zoomin", backupPdfViewerState);

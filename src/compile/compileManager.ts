@@ -43,6 +43,21 @@ const pdfViewRecord: {
     }
 } = {};
 
+/**
+ * The real file for a path in the project, when the project is synced to a folder and has it. Taking the user to the
+ * online copy of it instead would open a second tab of the same file, without what VS Code knows about the local one.
+ */
+async function localFileFor(path: string) {
+    const local = await LocalReplicaSCMProvider.pathToUri(path);
+    if (!local) { return undefined; }
+    try {
+        await vscode.workspace.fs.stat(local);
+        return local;
+    } catch {
+        return undefined; // like what a compile generates, which stays online
+    }
+}
+
 interface CompileLogSummary {
     available: boolean;
     errors: string[];
@@ -56,7 +71,7 @@ class CompileDiagnosticProvider {
     private async getRange(log: ErrorSchema, path: string, vfs: any) {
         let textDoc: vscode.TextDocument;
         try {
-            textDoc = (await vscode.workspace.openTextDocument(vfs.pathToUri(path)));
+            textDoc = (await vscode.workspace.openTextDocument((await localFileFor(path)) ?? vfs.pathToUri(path)));
         }
         catch (error) {
             return null;
@@ -134,7 +149,7 @@ class CompileDiagnosticProvider {
         }
         for (const file in diagnosticsRecorder) {
             const diagnostics = diagnosticsRecorder[file];
-            const _uri = vfs.pathToUri(file);
+            const _uri = (await localFileFor(file)) ?? vfs.pathToUri(file);
             this.diagnosticCollection.set(_uri, diagnostics);
         }
         return {available: true, errors, warningCount};
@@ -179,6 +194,11 @@ export class CompileManager {
             } else {
                 pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel}};
             }
+            webviewPanel.onDidDispose(() => {
+                if (pdfViewRecord[identifier]?.[filePath]?.webviewPanel===webviewPanel) {
+                    delete pdfViewRecord[identifier][filePath];
+                }
+            });
         });
     }
 
@@ -364,7 +384,7 @@ export class CompileManager {
             const pdfUri = uri.with({
                 path: `/${rootPath}/${OUTPUT_FOLDER_NAME}/output.pdf`,
             });
-            vscode.commands.executeCommand('vscode.openWith', pdfUri,
+            await vscode.commands.executeCommand('vscode.openWith', pdfUri,
                 `${ROOT_NAME}.pdfViewer`,
                 { preview: false, viewColumn: vscode.ViewColumn.Beside, preserveFocus }
             );
@@ -373,26 +393,37 @@ export class CompileManager {
 
     async syncCode() {
         const uri = await CompileManager.check();
-        if (uri && vscode.window.activeTextEditor) {
-            const { identifier, pathParts } = parseUri(uri);
-            const startPoint = vscode.window.activeTextEditor.selection.start;
-            const filePath = pathParts.join('/');
-            const line = startPoint.line;
-            const column = startPoint.character;
-            this.vfsm.prefetch(uri)
-                .then((vfs) => vfs.syncCode(filePath, line, column))
-                .then((res) => {
-                    if (res) {
-                        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
-                        const webview = pdfViewRecord[identifier][pdfPath].webviewPanel.webview;
-                        // get page
-                        webview.postMessage({
-                            type: 'syncCode',
-                            content: res
-                        });
-                    }
-                });
+        const editor = vscode.window.activeTextEditor;
+        if (!uri || !editor) { return; }
+
+        // In a synced folder the project's address says nothing about which of its files this is.
+        const document = editor.document.uri;
+        const filePath = document.scheme===ROOT_NAME ?
+            parseUri(document).pathParts.join('/') :
+            (await LocalReplicaSCMProvider.uriToPath(document))?.replace(/^\//, '');
+        if (!filePath) {
+            vscode.window.showInformationMessage('这个文件不属于 Overleaf 项目，PDF 里没有它的位置。');
+            return;
         }
+
+        const { line, character } = editor.selection.start;
+        const vfs = await this.vfsm.prefetch(uri);
+        const position = await vfs.syncCode(filePath, line + 1, character); // the server counts lines from 1
+        if (position === undefined) { return; } // already reported
+        if (position.length === 0) {
+            vscode.window.showInformationMessage('PDF 里找不到这个位置，可能这里还没有编译过。');
+            return;
+        }
+
+        // Going to a place in the PDF is a request to see it, whether it is open, behind another tab or closed.
+        const { identifier } = parseUri(uri);
+        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
+        if (!pdfViewRecord[identifier]?.[pdfPath]) {
+            await this.openPdf(true);
+        }
+        const panel = pdfViewRecord[identifier]?.[pdfPath]?.webviewPanel;
+        panel?.reveal(panel.viewColumn, true);
+        await panel?.webview.postMessage({ type: 'syncCode', content: position });
     }
 
     private _revealSelectionInEditor(editor: vscode.TextEditor, targetLine: number, identifier: string) {
@@ -428,14 +459,14 @@ export class CompileManager {
     async syncPdf(r: { page: number, h: number, v: number, identifier: string }) {
         const uri = await CompileManager.check();
         if (uri) {
-            this.vfsm.prefetch(uri)
+            await this.vfsm.prefetch(uri)
                 .then((vfs) => vfs.syncPdf(r.page, r.h, r.v))
-                .then((res) => {
+                .then(async (res) => {
                     if (res) {
                         const { projectName } = parseUri(uri);
                         const { file, line, column } = res;
                         const _file = file.match(/output\.[^\.]+$/) ? `${OUTPUT_FOLDER_NAME}/${file}` : file;
-                        const fileUri = uri.with({ path: `/${projectName}/${_file}` });
+                        const fileUri = (await localFileFor(_file)) ?? uri.with({ path: `/${projectName}/${_file}` });
 
                         let viewColumnToUse: vscode.ViewColumn | undefined;
                         const existingEditor = vscode.window.visibleTextEditors.find(
@@ -448,7 +479,7 @@ export class CompileManager {
                             viewColumnToUse = vscode.window.visibleTextEditors.at(-1)?.viewColumn || vscode.ViewColumn.Beside;
                         }
 
-                        vscode.window.showTextDocument(fileUri, { viewColumn: viewColumnToUse, preserveFocus: false })
+                        await vscode.window.showTextDocument(fileUri, { viewColumn: viewColumnToUse, preserveFocus: false })
                             .then(
                                 (openedEditor) => {
                                     if (openedEditor) {

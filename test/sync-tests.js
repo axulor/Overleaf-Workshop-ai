@@ -2180,6 +2180,52 @@ async function testOnlineRename(FolderSync) {
   t.sync.dispose();
 }
 
+/** The engine's records are saved from several places, which may coincide. */
+async function testSavingRecords(FolderSync) {
+  const t = await setup(FolderSync, new FakeRemote({ 'main.tex': 'a\n' }));
+  await t.sync.flush();
+  await sleep(SETTLE_MS);
+  const onDisk = () => JSON.parse(fs.readFileSync(path.join(t.root, '.overleaf', 'sync', 'manifest.json'), 'utf8'));
+
+  let failure;
+  for (let round = 0; round < 20; round++) {
+    t.sync.manifestChanged = true;
+    const first = t.sync.saveManifest();
+    t.sync.manifestChanged = true;
+    const second = t.sync.saveManifest();
+    await Promise.all([first, second, t.sync.saveManifest()]).catch((e) => { failure = e; });
+  }
+  check('saving the records twice at once does not fail', failure === undefined, String(failure));
+  check('and leaves them readable', !!onDisk().files['main.tex']);
+
+  // a change while a save is under way
+  t.sync.manifest.files['before.tex'] = { kind: 'doc', hash: 'x' };
+  t.sync.manifestChanged = true;
+  const saving = t.sync.saveManifest();
+  await sleep(0);
+  t.sync.manifest.files['during.tex'] = { kind: 'doc', hash: 'y' };
+  t.sync.manifestChanged = true;
+  await saving;
+  await t.sync.saveManifest();
+  check('a change made during a save is saved too', !!onDisk().files['during.tex'] && !!onDisk().files['before.tex'], JSON.stringify(Object.keys(onDisk().files)));
+  delete t.sync.manifest.files['before.tex'];
+  delete t.sync.manifest.files['during.tex'];
+
+  // a save that fails is not the end of saving: here its folder is, for the moment, not a place anything can be written
+  const realStateDir = t.sync.stateDir;
+  t.sync.stateDir = vscode.Uri.file(path.join(t.root, 'main.tex', 'not-a-folder'));
+  t.sync.manifest.files['retried.tex'] = { kind: 'doc', hash: 'z' };
+  t.sync.manifestChanged = true;
+  const refused = await t.sync.saveManifest().then(() => false, () => true);
+  check('a save that fails reports it', refused);
+  check('and is still to be done', t.sync.manifestChanged === true);
+  t.sync.stateDir = realStateDir;
+  await t.sync.saveManifest();
+  check('and the next one works', !!onDisk().files['retried.tex'], JSON.stringify(Object.keys(onDisk().files)));
+  delete t.sync.manifest.files['retried.tex'];
+  t.sync.dispose();
+}
+
 /** Deleting the local folder is no statement about the online project. */
 async function testFolderDeleted(FolderSync) {
   let linked = true;
@@ -2625,6 +2671,7 @@ exports.run = async function () {
     await testSafety(FolderSync, merge);
     await testFolders(FolderSync);
     await testOnlineRename(FolderSync);
+    await testSavingRecords(FolderSync);
     await testFolderDeleted(FolderSync);
     await testStanding(require(path.join(out, 'sync', 'index.js')).FolderSyncManager, require(path.join(out, 'scm', 'localReplicaSCM.js')).LocalReplicaSCMProvider);
     await testProjectStanding(require(path.join(out, 'core', 'remoteFileSystemProvider.js')).RemoteFileSystemProvider, require(path.join(out, 'api', 'base.js')).BaseAPI);
