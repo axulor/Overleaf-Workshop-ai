@@ -2,7 +2,7 @@
   "name": "overleaf-workshop-ai",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "icon": "resources/icons/app_icon.png",
   "license": "AGPL-3.0-only",
   "author": {
@@ -404,7 +404,10 @@
       {
         "command": "overleaf-workshop.compileManager.compile",
         "title": "%commands.compileManager.compile.title%",
-        "icon": "$(play-circle)",
+        "icon": {
+          "light": "resources/icons/compile-light.svg",
+          "dark": "resources/icons/compile-dark.svg"
+        },
         "enablement": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
         "category": "%extension.displayName%"
       },

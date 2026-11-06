@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This fork has its own version numbers, starting from Overleaf Workshop 0.15.10. Entries below this section are from the original project.
 
+### [0.7.2] - 2026-11-06
+- The compile button is a green leaf with a play shape cut out of it, instead of a circled triangle that looked like other extensions' run buttons.
+
 ### [0.7.1] - 2026-11-06
 Jumping between the code and the PDF from a synced folder, checked on real Overleaf with the real shortcut.
 - Double-clicking the PDF opens the real local file. Before this, it opened a second tab of the online copy, without the section names and anything else VS Code knows about the local file.
